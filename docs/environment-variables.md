@@ -45,14 +45,60 @@ in the inherited process environment.
 | `RMEM` | `-M`, `--rmem` | `0` (system default) | UDP receive‑buffer size in bytes. Raise the OS limit first: `sudo sysctl -w net.core.rmem_max=52428800`. |
 | *(config file)* | `-c`, `--config` | *(none)* | Path to an extra INI config file (see precedence above). |
 | `TEST_HBBS` 🅴 | *(none)* | *(auto)* | UDP self‑test target checked at start‑up. Set to `no` to skip the check (useful behind some NATs/proxies), or to an explicit `host:port`. |
-| `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
+| `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole-punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
+| `FEDERATION-NODE-ID` 🅴 | — | *(empty)* | A stable node name such as `A`, `B`, or `C`. Enables centralized hbbs federation when any other `FEDERATION-*` setting is present. |
+| `FEDERATION-MASTER` 🅴 | — | *(empty)* | Address of the public master node's federation listener. Set this on an edge node; leave empty on the master. |
+| `FEDERATION-BIND` 🅴 | — | *(empty)* | Local `host:port` on which the node accepts federation links. Set this on the public master, for example `0.0.0.0:21200`. |
+| `FEDERATION-KEY` 🅴 | — | *(empty)* | Shared secret required for hbbs node links. Federation refuses to start when it is enabled without this value. |
+| `FEDERATION-RELAY` 🅴 | — | first `RELAY-SERVERS` entry | Relay address that clients in this node's local network can reach. An edge node advertises this to the master. |
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
 
 🅴 = set through the inherited process environment.
 
 > `PORT_FOR_API` / `KEY_FOR_API` are only used by RustDesk Server **Pro** and its
-> API; they have no effect in the open‑source server.
+> API; they have no effect in the open-source server.
+
+### Centralized edge-node federation
+
+The federation settings implement a hub-and-spoke topology. The public master
+node accepts outbound links from edge nodes, keeps their peer leases, and
+forwards cross-node rendezvous messages. The client protocol remains unchanged.
+
+On the public master **A**:
+
+```ini
+FEDERATION_NODE_ID=A
+FEDERATION_BIND=0.0.0.0:21200
+FEDERATION_KEY=shared-cluster-secret
+FEDERATION_RELAY=relay-a.example.com:21117
+RELAY-SERVERS=relay-a.example.com:21117
+```
+
+On an edge node **B** inside a private site:
+
+```ini
+FEDERATION_NODE_ID=B
+FEDERATION_MASTER=master-a.example.com:21200
+FEDERATION_KEY=shared-cluster-secret
+FEDERATION_RELAY=192.168.50.1:21117
+RELAY-SERVERS=192.168.50.1:21117
+RELAY-UPSTREAM=relay-a.example.com:21117
+```
+
+The same pattern applies to C and D. The edge `hbbs` connects out to A and
+advertises its local Relay address. The edge `hbbr` accepts local client Relay
+connections and forwards their byte stream to A's `hbbr`. A client in site A
+can therefore connect to a client in site B without either client needing to
+reach the other site's private address.
+
+Use the same non-empty `KEY` for the hbbs/hbbr instances participating in a
+cluster when Relay authentication is enabled. `FEDERATION-KEY` authenticates
+node links and is independent from the client/Relay key.
+
+The federation listener is a node-to-node service and should be protected by
+the firewall. It is not a replacement for the client-facing hbbs or hbbr
+ports.
 
 ---
 
@@ -63,6 +109,7 @@ in the inherited process environment.
 | `KEY` | `-k`, `--key` | *(empty)* | The empty default intentionally disables relay key validation, avoiding key-pair setup and mismatch failures. To enable relay key validation, use the same non-empty key as `hbbs`; `-` / `_` have the same behavior and load or generate a key pair. An empty key allows clients without a matching key to use the relay, so choose this tradeoff deliberately on an exposed server. |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which the relay TCP and WebSocket listeners bind. Supported by `.env` and the inherited environment; `hbbr` does not support `--config`. |
 | `PORT` | `-p`, `--port` | `21117` | Relay listening port. `hbbr` also binds `PORT+2` for WebSocket relay. **Note:** when set via the `PORT` env var (not `-p`), `hbbr` listens on `PORT + 1`, so a shared `PORT=21116` makes `hbbs`=21116 and `hbbr`=21117. |
+| `RELAY-UPSTREAM` 🅴 | — | *(empty)* | Edge-only upstream Relay such as `relay-a.example.com:21117`. When set, the edge hbbr forwards each Relay session to the upstream hbbr while clients continue to connect to the local hbbr. |
 
 ### Relay bandwidth / QoS
 

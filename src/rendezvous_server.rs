@@ -1,4 +1,7 @@
 use crate::common::*;
+use crate::federation::{
+    Event as FederationEvent, Federation, ForwardKind, ForwardMessage, RemoteRoute,
+};
 use crate::peer::*;
 use hbb_common::{
     allow_err, bail,
@@ -83,6 +86,7 @@ struct Inner {
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
+    federation: Federation,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
@@ -114,7 +118,34 @@ impl RendezvousServer {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
-        let pm = PeerMap::new().await?;
+        let node_id = get_arg("FEDERATION_NODE_ID");
+        let federation_master = get_arg("FEDERATION_MASTER");
+        let federation_bind = get_arg("FEDERATION_BIND");
+        let federation_key = get_arg("FEDERATION_KEY");
+        let federation_relay = get_arg_or(
+            "FEDERATION_RELAY",
+            get_arg("relay-servers")
+                .split(',')
+                .find(|value| !value.is_empty())
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        let (federation, mut federation_rx) = if node_id.is_empty()
+            && federation_master.is_empty()
+            && federation_bind.is_empty()
+        {
+            Federation::disabled()
+        } else {
+            Federation::start(
+                node_id.clone(),
+                federation_master,
+                federation_bind,
+                federation_key,
+                federation_relay,
+            )
+            .await?
+        };
+        let pm = PeerMap::new(federation.node_id().to_owned()).await?;
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
@@ -138,6 +169,7 @@ impl RendezvousServer {
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
+            federation,
             tx: tx.clone(),
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
@@ -211,6 +243,7 @@ impl RendezvousServer {
                         &mut listener_console,
                         &mut socket,
                         &key,
+                        &mut federation_rx,
                     )
                     .await
                 {
@@ -253,6 +286,7 @@ impl RendezvousServer {
         listener_console: &mut Option<TcpListener>,
         socket: &mut FramedSocket,
         key: &str,
+        federation_rx: &mut mpsc::UnboundedReceiver<FederationEvent>,
     ) -> LoopFailure {
         let mut timer_check_relay = interval(Duration::from_millis(CHECK_RELAY_TIMEOUT));
         loop {
@@ -271,6 +305,11 @@ impl RendezvousServer {
                         Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
+                    }
+                }
+                Some(event) = federation_rx.recv() => {
+                    if let Err(err) = self.handle_federation_event(event, socket).await {
+                        log::warn!("federation event failed: {}", err);
                     }
                 }
                 res = socket.next() => {
@@ -356,7 +395,9 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        self.update_addr(rp.id, addr, socket).await?;
+                        let id = rp.id;
+                        self.update_addr(id.clone(), addr, socket).await?;
+                        self.publish_peer(&id).await;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_configure_update(ConfigUpdate {
@@ -444,8 +485,11 @@ impl RendezvousServer {
                         }
                     }
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        self.pm
+                            .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
+                            .await;
                     }
+                    self.publish_peer(&id).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: register_pk_response::Result::OK.into(),
@@ -516,7 +560,11 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    if self.pm.remote_owner(&ph.id).await.is_some() {
+                        allow_err!(self.handle_remote_punch_request(addr, ph, key).await);
+                    } else {
+                        allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    }
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -524,7 +572,10 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    if self.pm.remote_owner(&rf.id).await.is_some() {
+                        rf.socket_addr = AddrMangle::encode(addr).into();
+                        allow_err!(self.handle_remote_forward_request(addr, rf).await);
+                    } else if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
@@ -535,6 +586,9 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    if let Ok(true) = self.forward_relay_response(addr_b, rr.clone()).await {
+                        return true;
+                    }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
                     if !id.is_empty() {
@@ -648,6 +702,33 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        if let Some(route) = self.federation.route_for(addr_a, Some(&phs.id)).await {
+            let mut msg_out = RendezvousMessage::new();
+            let mut p = PunchHoleResponse {
+                socket_addr: AddrMangle::encode(addr).into(),
+                pk: self.get_pk(&phs.version, phs.id.clone()).await,
+                relay_server: route.source_relay.clone(),
+                ..Default::default()
+            };
+            if let Ok(t) = phs.nat_type.enum_value() {
+                p.set_nat_type(t);
+            }
+            msg_out.set_punch_hole_response(p);
+            self.forward_response(
+                ForwardMessage {
+                    kind: ForwardKind::ToSource,
+                    source_node: self.federation.node_id().to_owned(),
+                    target_node: route.source_node,
+                    source_addr: route.source_addr.to_string(),
+                    target_id: route.target_id,
+                    source_relay: route.source_relay,
+                    payload: Vec::new(),
+                },
+                msg_out,
+            )
+            .await?;
+            return Ok(());
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
@@ -682,6 +763,31 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        if let Some(route) = self.federation.route_for(addr_a, Some(&la.id)).await {
+            let mut msg_out = RendezvousMessage::new();
+            let mut p = PunchHoleResponse {
+                socket_addr: la.local_addr.clone(),
+                pk: self.get_pk(&la.version, la.id.clone()).await,
+                relay_server: route.source_relay.clone(),
+                ..Default::default()
+            };
+            p.set_is_local(true);
+            msg_out.set_punch_hole_response(p);
+            self.forward_response(
+                ForwardMessage {
+                    kind: ForwardKind::ToSource,
+                    source_node: self.federation.node_id().to_owned(),
+                    target_node: route.source_node,
+                    source_addr: route.source_addr.to_string(),
+                    target_id: route.target_id,
+                    source_relay: route.source_relay,
+                    payload: Vec::new(),
+                },
+                msg_out,
+            )
+            .await?;
+            return Ok(());
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
@@ -909,6 +1015,320 @@ impl RendezvousServer {
         Ok(())
     }
 
+    async fn publish_peer(&self, id: &str) {
+        if let Some(lease) = self.pm.snapshot(id).await {
+            self.federation.publish_peer(lease).await;
+        }
+    }
+
+    async fn handle_federation_event(
+        &mut self,
+        event: FederationEvent,
+        socket: &mut FramedSocket,
+    ) -> ResultType<()> {
+        match event {
+            FederationEvent::Connected {
+                node_id,
+                relay_server,
+            } => {
+                log::info!("federation connected: node={} relay={}", node_id, relay_server);
+                let snapshots = self.pm.snapshots().await;
+                if self.federation.is_master() {
+                    for lease in snapshots {
+                        self.federation.send_peer_to(&node_id, lease).await;
+                    }
+                } else {
+                    for lease in snapshots {
+                        self.federation.publish_peer(lease).await;
+                    }
+                }
+            }
+            FederationEvent::Disconnected { node_id } => {
+                let ids = self.pm.remove_remote(&node_id).await;
+                for id in ids {
+                    self.federation.publish_remove(node_id.clone(), id).await;
+                }
+            }
+            FederationEvent::Peer { from_node, lease } => {
+                self.pm.upsert_remote(from_node.clone(), lease.clone()).await;
+                if self.federation.is_master() {
+                    self.federation
+                        .broadcast_peer(lease, Some(&from_node))
+                        .await;
+                }
+            }
+            FederationEvent::PeerRemove {
+                from_node,
+                owner,
+                id,
+            } => {
+                if self.federation.is_master() && owner != from_node {
+                    log::warn!(
+                        "rejecting federation peer removal: link={} owner={}",
+                        from_node,
+                        owner
+                    );
+                    return Ok(());
+                }
+                self.pm.remove_remote_peer(&owner, &id).await;
+                if self.federation.is_master() {
+                    self.federation
+                        .broadcast_remove(owner, id, Some(&from_node))
+                        .await;
+                }
+            }
+            FederationEvent::Forward {
+                from_node,
+                message,
+            } => {
+                if self.federation.is_master() && message.source_node != from_node {
+                    log::warn!(
+                        "rejecting federation forward: link={} source={}",
+                        from_node,
+                        message.source_node
+                    );
+                    return Ok(());
+                }
+                if message.target_node != self.federation.node_id() {
+                    if self.federation.is_master() {
+                        let target_node = message.target_node.clone();
+                        self.federation
+                            .send_forward_to(&target_node, message)
+                            .await;
+                    }
+                    return Ok(());
+                }
+                match message.kind {
+                    ForwardKind::ToPeer => {
+                        self.handle_federated_to_peer(message, socket).await?;
+                    }
+                    ForwardKind::ToSource => {
+                        self.handle_federated_to_source(message, socket).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_federated_to_peer(
+        &mut self,
+        message: ForwardMessage,
+        socket: &mut FramedSocket,
+    ) -> ResultType<()> {
+        let source_addr = message.source_addr.parse::<SocketAddr>()?;
+        let peer = self.pm.get_in_memory(&message.target_id).await;
+        let Some(peer) = peer else {
+            return self
+                .forward_failure(message, punch_hole_response::Failure::ID_NOT_EXIST)
+                .await;
+        };
+        let (peer_addr, owner, elapsed) = {
+            let peer = peer.read().await;
+            (
+                peer.socket_addr,
+                peer.owner.clone(),
+                peer.last_reg_time.elapsed().as_millis() as i64,
+            )
+        };
+        if owner != self.federation.node_id() || elapsed >= REG_TIMEOUT {
+            return self
+                .forward_failure(message, punch_hole_response::Failure::OFFLINE)
+                .await;
+        }
+        self.federation
+            .remember_route(RemoteRoute {
+                source_node: message.source_node.clone(),
+                source_addr,
+                target_id: message.target_id.clone(),
+                source_relay: message.source_relay.clone(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            })
+            .await;
+        let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
+        self.send_to_client(msg, peer_addr, socket).await
+    }
+
+    async fn handle_federated_to_source(
+        &mut self,
+        message: ForwardMessage,
+        socket: &mut FramedSocket,
+    ) -> ResultType<()> {
+        let source_addr = message.source_addr.parse::<SocketAddr>()?;
+        let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
+        self.send_to_client(msg, source_addr, socket).await
+    }
+
+    async fn forward_failure(
+        &self,
+        message: ForwardMessage,
+        failure: punch_hole_response::Failure,
+    ) -> ResultType<()> {
+        let mut msg = RendezvousMessage::new();
+        msg.set_punch_hole_response(PunchHoleResponse {
+            failure: failure.into(),
+            ..Default::default()
+        });
+        self.forward_response(message, msg).await
+    }
+
+    async fn forward_response(
+        &self,
+        route: ForwardMessage,
+        mut msg: RendezvousMessage,
+    ) -> ResultType<()> {
+        if let Some(rendezvous_message::Union::RelayResponse(rr)) = msg.union.as_mut() {
+            rr.relay_server = route.source_relay.clone();
+        }
+        if let Some(rendezvous_message::Union::PunchHoleResponse(response)) = msg.union.as_mut() {
+            response.relay_server = route.source_relay.clone();
+        }
+        self.federation
+            .send_forward(ForwardMessage {
+                kind: ForwardKind::ToSource,
+                source_node: self.federation.node_id().to_owned(),
+                target_node: route.source_node,
+                source_addr: route.source_addr,
+                target_id: route.target_id,
+                source_relay: route.source_relay,
+                payload: msg.write_to_bytes()?,
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn send_to_client(
+        &mut self,
+        msg: RendezvousMessage,
+        addr: SocketAddr,
+        socket: &mut FramedSocket,
+    ) -> ResultType<()> {
+        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        if sink.is_some() {
+            Self::send_to_sink(&mut sink, msg).await;
+        } else {
+            socket.send(&msg, addr).await?;
+        }
+        Ok(())
+    }
+
+    async fn handle_remote_punch_request(
+        &mut self,
+        addr: SocketAddr,
+        ph: PunchHoleRequest,
+        key: &str,
+    ) -> ResultType<()> {
+        if !key.is_empty() && ph.licence_key != key {
+            let mut msg = RendezvousMessage::new();
+            msg.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            let mut socket = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+            Self::send_to_sink(&mut socket, msg).await;
+            return Ok(());
+        }
+        let target_id = ph.id.clone();
+        let Some(target_node) = self.pm.remote_owner(&target_id).await else {
+            return Ok(());
+        };
+        if let Some(peer) = self.pm.get(&target_id).await {
+            if peer.read().await.last_reg_time.elapsed().as_millis() as i64 >= REG_TIMEOUT {
+                let mut msg = RendezvousMessage::new();
+                msg.set_punch_hole_response(PunchHoleResponse {
+                    failure: punch_hole_response::Failure::OFFLINE.into(),
+                    ..Default::default()
+                });
+                let mut socket = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+                Self::send_to_sink(&mut socket, msg).await;
+                return Ok(());
+            }
+        }
+        let mut msg = RendezvousMessage::new();
+        msg.set_punch_hole(PunchHole {
+            socket_addr: AddrMangle::encode(addr).into(),
+            nat_type: NatType::SYMMETRIC.into(),
+            relay_server: self.federation.relay_for(&target_node).await.unwrap_or_default(),
+            ..Default::default()
+        });
+        self.federation
+            .send_forward(ForwardMessage {
+                kind: ForwardKind::ToPeer,
+                source_node: self.federation.node_id().to_owned(),
+                target_node,
+                source_addr: addr.to_string(),
+                target_id,
+                source_relay: self.local_relay_server(),
+                payload: msg.write_to_bytes()?,
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn handle_remote_forward_request(
+        &mut self,
+        addr: SocketAddr,
+        mut rf: RequestRelay,
+    ) -> ResultType<()> {
+        let target_id = rf.id.clone();
+        let Some(target_node) = self.pm.remote_owner(&target_id).await else {
+            return Ok(());
+        };
+        rf.socket_addr = AddrMangle::encode(addr).into();
+        let mut msg = RendezvousMessage::new();
+        msg.set_request_relay(rf);
+        self.federation
+            .send_forward(ForwardMessage {
+                kind: ForwardKind::ToPeer,
+                source_node: self.federation.node_id().to_owned(),
+                target_node,
+                source_addr: addr.to_string(),
+                target_id,
+                source_relay: self.local_relay_server(),
+                payload: msg.write_to_bytes()?,
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn forward_relay_response(
+        &mut self,
+        addr: SocketAddr,
+        mut rr: RelayResponse,
+    ) -> ResultType<bool> {
+        let route = self.federation.route_for(addr, Some(rr.id())).await;
+        let Some(route) = route else {
+            return Ok(false);
+        };
+        rr.socket_addr = Default::default();
+        let id = rr.id().to_owned();
+        if !id.is_empty() {
+            let pk = self.get_pk(&rr.version, id).await;
+            rr.set_pk(pk);
+        }
+        rr.relay_server = route.source_relay.clone();
+        let mut msg = RendezvousMessage::new();
+        msg.set_relay_response(rr);
+        self.forward_response(
+            ForwardMessage {
+                kind: ForwardKind::ToSource,
+                source_node: self.federation.node_id().to_owned(),
+                target_node: route.source_node,
+                source_addr: route.source_addr.to_string(),
+                target_id: route.target_id,
+                source_relay: route.source_relay,
+                payload: Vec::new(),
+            },
+            msg,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    fn local_relay_server(&self) -> String {
+        self.relay_servers.first().cloned().unwrap_or_default()
+    }
+
     async fn check_ip_blocker(&self, ip: &str, id: &str) -> bool {
         let mut lock = IP_BLOCKER.lock().await;
         let now = Instant::now();
@@ -1130,7 +1550,7 @@ impl RendezvousServer {
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                         let res = rs.check_cmd(data).await;
-                        stream.write(res.as_bytes()).await.ok();
+                        stream.write_all(res.as_bytes()).await.ok();
                     }
                 }
             });

@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::database;
+use crate::federation::PeerLease;
 use hbb_common::{
     bytes::Bytes,
     log,
@@ -39,6 +40,7 @@ pub(crate) struct Peer {
     pub(crate) info: PeerInfo,
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
+    pub(crate) owner: String,
 }
 
 impl Default for Peer {
@@ -53,6 +55,7 @@ impl Default for Peer {
             // user: None,
             // disabled: false,
             reg_pk: (0, get_expired_time()),
+            owner: String::new(),
         }
     }
 }
@@ -63,10 +66,11 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
     pub(crate) db: database::Database,
+    local_node: String,
 }
 
 impl PeerMap {
-    pub(crate) async fn new() -> ResultType<Self> {
+    pub(crate) async fn new(local_node: String) -> ResultType<Self> {
         let db = get_arg_opt("DB_URL").unwrap_or_else(|| {
             let mut db = "db_v2.sqlite3".to_owned();
             #[cfg(all(windows, not(debug_assertions)))]
@@ -85,6 +89,7 @@ impl PeerMap {
         let pm = Self {
             map: Default::default(),
             db: database::Database::new(&db).await?,
+            local_node,
         };
         Ok(pm)
     }
@@ -107,6 +112,7 @@ impl PeerMap {
             w.pk = pk.clone();
             w.last_reg_time = Instant::now();
             w.info.ip = ip;
+            w.owner = self.local_node.clone();
             (
                 serde_json::to_string(&w.info).unwrap_or_default(),
                 w.guid.clone(),
@@ -145,6 +151,7 @@ impl PeerMap {
                 // user: v.user,
                 info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
                 // disabled: v.status == Some(0),
+                owner: self.local_node.clone(),
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
@@ -163,7 +170,10 @@ impl PeerMap {
         if let Some(p) = w.get(id) {
             return p.clone();
         }
-        let tmp = LockPeer::default();
+        let tmp = Arc::new(RwLock::new(Peer {
+            owner: self.local_node.clone(),
+            ..Default::default()
+        }));
         w.insert(id.to_owned(), tmp.clone());
         tmp
     }
@@ -176,5 +186,93 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+
+    pub(crate) async fn remote_owner(&self, id: &str) -> Option<String> {
+        let peer = self.map.read().await.get(id).cloned()?;
+        let peer = peer.read().await;
+        if peer.owner.is_empty() || peer.owner == self.local_node {
+            None
+        } else {
+            Some(peer.owner.clone())
+        }
+    }
+
+    pub(crate) async fn upsert_remote(&self, owner: String, lease: PeerLease) {
+        if owner.is_empty() || owner == self.local_node {
+            return;
+        }
+        let peer = {
+            let mut map = self.map.write().await;
+            map.entry(lease.id.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(Peer::default())))
+                .clone()
+        };
+        let mut peer = peer.write().await;
+        if peer.owner == self.local_node {
+            return;
+        }
+        peer.socket_addr = "0.0.0.0:0".parse().unwrap_or(peer.socket_addr);
+        peer.last_reg_time = Instant::now();
+        peer.uuid = lease.uuid.into();
+        peer.pk = lease.pk.into();
+        peer.info.ip = lease.ip;
+        peer.owner = owner;
+    }
+
+    pub(crate) async fn remove_remote(&self, owner: &str) -> Vec<String> {
+        let mut map = self.map.write().await;
+        let ids: Vec<String> = map
+            .iter()
+            .filter_map(|(id, peer)| {
+                if let Ok(peer) = peer.try_read() {
+                    if peer.owner == owner {
+                        return Some(id.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+        for id in &ids {
+            map.remove(id);
+        }
+        ids
+    }
+
+    pub(crate) async fn remove_remote_peer(&self, owner: &str, id: &str) {
+        let mut map = self.map.write().await;
+        let remove = map
+            .get(id)
+            .and_then(|peer| peer.try_read().ok())
+            .map(|peer| peer.owner == owner)
+            .unwrap_or(false);
+        if remove {
+            map.remove(id);
+        }
+    }
+
+    pub(crate) async fn snapshot(&self, id: &str) -> Option<PeerLease> {
+        let peer = self.map.read().await.get(id).cloned()?;
+        let peer = peer.read().await;
+        if peer.owner != self.local_node || peer.pk.is_empty() {
+            return None;
+        }
+        Some(PeerLease {
+            id: id.to_owned(),
+            uuid: peer.uuid.to_vec(),
+            pk: peer.pk.to_vec(),
+            ip: peer.info.ip.clone(),
+        })
+    }
+
+    pub(crate) async fn snapshots(&self) -> Vec<PeerLease> {
+        let ids: Vec<String> = self.map.read().await.keys().cloned().collect();
+        let mut snapshots = Vec::new();
+        for id in ids {
+            if let Some(snapshot) = self.snapshot(&id).await {
+                snapshots.push(snapshot);
+            }
+        }
+        snapshots
     }
 }

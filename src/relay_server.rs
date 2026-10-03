@@ -52,6 +52,7 @@ pub async fn start_with_bind(
     key: &str,
 ) -> ResultType<()> {
     let key = get_server_sk(key);
+    let upstream = crate::common::get_arg("RELAY_UPSTREAM");
     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
@@ -86,6 +87,9 @@ pub async fn start_with_bind(
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
+    if !upstream.is_empty() {
+        log::info!("Relay upstream: {}", upstream);
+    }
     let main_task = async move {
         loop {
             log::info!("Start");
@@ -94,6 +98,7 @@ pub async fn start_with_bind(
                 crate::common::listen_tcp(bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
                 &key,
+                &upstream,
             )
             .await;
         }
@@ -338,6 +343,7 @@ async fn io_loop(
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
     key: &str,
+    upstream: &str,
 ) {
     check_params();
     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
@@ -347,7 +353,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key, upstream, false).await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -359,7 +365,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, true).await;
+                        handle_connection(stream, addr, &limiter, key, upstream, true).await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -371,7 +377,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, false).await;
+                        handle_connection(stream, addr, &limiter, key, upstream, false).await;
                     }
                     Err(err) => {
                        log::error!("console listener.accept failed: {}", err);
@@ -388,6 +394,7 @@ async fn handle_connection(
     addr: SocketAddr,
     limiter: &Limiter,
     key: &str,
+    upstream: &str,
     ws: bool,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
@@ -399,7 +406,7 @@ async fn handle_connection(
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                     let res = check_cmd(data, limiter).await;
-                    stream.write(res.as_bytes()).await.ok();
+                    stream.write_all(res.as_bytes()).await.ok();
                 }
             }
         });
@@ -411,9 +418,10 @@ async fn handle_connection(
         return;
     }
     let key = key.to_owned();
+    let upstream = upstream.to_owned();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
+        allow_err!(make_pair(stream, addr, &key, limiter, &upstream, ws).await);
     });
 }
 
@@ -422,6 +430,7 @@ async fn make_pair(
     mut addr: SocketAddr,
     key: &str,
     limiter: Limiter,
+    upstream: &str,
     ws: bool,
 ) -> ResultType<()> {
     if ws {
@@ -451,20 +460,50 @@ async fn make_pair(
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, key, limiter, upstream).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, upstream).await;
     }
     Ok(())
 }
 
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    key: &str,
+    limiter: Limiter,
+    upstream: &str,
+) {
     let mut stream = stream;
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
+                    return;
+                }
+                if !upstream.is_empty() {
+                    let mut upstream = match FramedStream::new(upstream, None, 5_000).await {
+                        Ok(upstream) => upstream,
+                        Err(err) => {
+                            log::warn!("failed to connect relay upstream {}: {}", upstream, err);
+                            return;
+                        }
+                    };
+                    if let Err(err) = upstream.send_raw(bytes.clone().into()).await {
+                        log::warn!("failed to send relay request upstream: {}", err);
+                        return;
+                    }
+                    let mut peer: Box<dyn StreamTrait> = Box::new(upstream);
+                    let id = format!("{}:{}", addr.ip(), addr.port());
+                    USAGE.write().await.insert(id.clone(), Default::default());
+                    stream.set_raw();
+                    peer.set_raw();
+                    if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
+                    {
+                        log::info!("Relay upstream of {} closed: {}", addr, err);
+                    }
+                    USAGE.write().await.remove(&id);
                     return;
                 }
                 if !rf.uuid.is_empty() {
