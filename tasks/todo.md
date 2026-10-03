@@ -11,9 +11,9 @@
 # Linux Release 工作流
 
 - [x] 移除本分支不需要的 Docker 构建和推送 jobs
-- [x] 保留 Linux 多架构 binary/DEB 构建，并汇总为单一 GitHub Release
+- [x] 保留 Linux amd64 binary/DEB 构建，并汇总为单一 GitHub Release
 - [x] 增加 tag/包版本校验、校验和以及手动 workflow_dispatch 发布入口
 - [ ] 通过 GitHub Actions 实际生成并核验 v1.1.17 Release 资产
 
 影响范围：`.github/workflows/build.yaml`、Linux binary/DEB Release 资产。
-完成标准：Release 至少包含 Linux binary 压缩包和 `rustdesk-server-*.deb`，且 workflow 不依赖 Docker secrets。
+完成标准：Release 至少包含 Linux amd64 binary 压缩包和 `rustdesk-server-*.deb`，且 workflow 不依赖 Docker secrets 或跨编译容器。

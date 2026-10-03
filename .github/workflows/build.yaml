@@ -85,18 +85,9 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build Linux - ${{ matrix.job.name }}
+    name: Build Linux amd64
     needs: prepare
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - { name: "amd64",   target: "x86_64-unknown-linux-musl" }
-          - { name: "arm64v8", target: "aarch64-unknown-linux-musl" }
-          - { name: "armv7",   target: "armv7-unknown-linux-musleabihf" }
-          - { name: "i386",    target: "i686-unknown-linux-musl" }
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,168 +95,64 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          default: true
-          components: rustfmt
-          profile: minimal
-          target: ${{ matrix.job.target }}
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --locked --release --all-features --target=${{ matrix.job.target }}
-          use-cross: true
+      - name: Build Linux binaries
+        run: cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils
 
       - name: Check binary outputs
         run: |
           set -euo pipefail
-          chmod -v a+x target/${{ matrix.job.target }}/release/{hbbs,hbbr,rustdesk-utils}
-          file target/${{ matrix.job.target }}/release/{hbbs,hbbr,rustdesk-utils}
+          chmod -v a+x target/release/{hbbs,hbbr,rustdesk-utils}
+          file target/release/{hbbs,hbbr,rustdesk-utils}
 
       - name: Publish Linux binaries
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-linux-${{ matrix.job.name }}
+          name: binaries-linux-amd64
           path: |
-            target/${{ matrix.job.target }}/release/hbbr
-            target/${{ matrix.job.target }}/release/hbbs
-            target/${{ matrix.job.target }}/release/rustdesk-utils
+            target/release/hbbr
+            target/release/hbbs
+            target/release/rustdesk-utils
           if-no-files-found: error
 
-  build-win:
-    name: Build Windows
-    needs: prepare
-    runs-on: windows-2022
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-          submodules: recursive
-
-      - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          default: true
-          components: rustfmt
-          profile: minimal
-          target: x86_64-pc-windows-msvc
-
-      - name: Build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --locked --release --all-features --target=x86_64-pc-windows-msvc
-          use-cross: true
-
-      - name: Install NSIS
-        shell: powershell
-        run: |
-          iwr -useb get.scoop.sh -outfile 'install.ps1'
-          .\install.ps1 -RunAsAdmin
-          scoop update
-          scoop bucket add extras
-          scoop install nsis
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 16
-
-      - name: Build UI browser file
-        run: |
-          npm i
-          npm run build
-        working-directory: ./ui/html
-
-      - name: Build UI setup file
-        shell: cmd
-        run: |
-          rustup default nightly
-          cargo build --release
-          xcopy /y ..\target\x86_64-pc-windows-msvc\release\*.exe setup\bin\
-          xcopy /y target\release\*.exe setup\
-          mkdir setup\logs
-          makensis /V1 setup.nsi
-          mkdir SignOutput
-          move RustDeskServer.Setup.exe SignOutput\
-          move ..\target\x86_64-pc-windows-msvc\release\*.exe SignOutput\
-        working-directory: ./ui
-
-      - name: Publish Windows binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-windows-x86_64
-          path: |
-            ui\SignOutput\hbbr.exe
-            ui\SignOutput\hbbs.exe
-            ui\SignOutput\rustdesk-utils.exe
-            ui\SignOutput\RustDeskServer.Setup.exe
-          if-no-files-found: error
-
-  package-binaries:
-    name: Package ${{ matrix.job.os }} - ${{ matrix.job.name }}
+  package-binary:
+    name: Package Linux binary
     needs:
       - prepare
       - build
-      - build-win
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - { os: "linux",   name: "amd64",   suffix: "" }
-          - { os: "linux",   name: "arm64v8", suffix: "" }
-          - { os: "linux",   name: "armv7",   suffix: "" }
-          - { os: "linux",   name: "i386",    suffix: "" }
-          - { os: "windows", name: "x86_64",  suffix: "-unsigned" }
-
     steps:
-      - name: Download binaries
+      - name: Download Linux binaries
         uses: actions/download-artifact@v4
         with:
-          name: binaries-${{ matrix.job.os }}-${{ matrix.job.name }}
+          name: binaries-linux-amd64
           path: input
 
-      - name: Package binaries
+      - name: Create Linux archive
         shell: bash
         run: |
           set -euo pipefail
-          chmod -v a+x input/*
-          sudo apt-get update
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends zip
+          test -f input/hbbs
+          test -f input/hbbr
+          test -f input/rustdesk-utils
           mkdir -p release-assets
-          zip -j "release-assets/rustdesk-server-${{ matrix.job.os }}-${{ matrix.job.name }}${{ matrix.job.suffix }}-${{ needs.prepare.outputs.tag }}.zip" input/*
+          tar -C input -czf "release-assets/rustdesk-server-linux-amd64-${{ needs.prepare.outputs.tag }}.tar.gz" hbbs hbbr rustdesk-utils
 
-      - name: Publish binary archive
+      - name: Publish Linux archive
         uses: actions/upload-artifact@v4
         with:
-          name: release-binary-${{ matrix.job.os }}-${{ matrix.job.name }}
-          path: release-assets/*.zip
+          name: release-binary-linux-amd64
+          path: release-assets/*.tar.gz
           if-no-files-found: error
 
   deb-package:
-    name: Build Debian package - ${{ matrix.job.name }}
+    name: Build Debian packages amd64
     needs:
       - prepare
       - build
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        job:
-          - { name: "amd64",   debian_platform: "amd64", crossbuild_package: "" }
-          - { name: "arm64v8", debian_platform: "arm64", crossbuild_package: "crossbuild-essential-arm64" }
-          - { name: "armv7",   debian_platform: "armhf", crossbuild_package: "crossbuild-essential-armhf" }
-          - { name: "i386",    debian_platform: "i386",  crossbuild_package: "crossbuild-essential-i386" }
-
     steps:
       - name: Checkout packaging files
         uses: actions/checkout@v4
@@ -275,40 +162,40 @@ jobs:
       - name: Install packaging tools
         run: |
           sudo apt-get update
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends devscripts build-essential debhelper pkg-config ${{ matrix.job.crossbuild_package }}
-          mkdir -p debian-build/${{ matrix.job.name }}/bin
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends devscripts build-essential debhelper pkg-config
+          mkdir -p debian-build/amd64/bin
 
       - name: Download Linux binaries
         uses: actions/download-artifact@v4
         with:
-          name: binaries-linux-${{ matrix.job.name }}
-          path: debian-build/${{ matrix.job.name }}/bin
+          name: binaries-linux-amd64
+          path: debian-build/amd64/bin
 
       - name: Build Debian packages
         shell: bash
         run: |
           set -euo pipefail
-          chmod -v a+x debian-build/${{ matrix.job.name }}/bin/*
-          cp -vr debian systemd debian-build/${{ matrix.job.name }}/
-          sed 's/{{ ARCH }}/${{ matrix.job.debian_platform }}/' debian/control.tpl > debian-build/${{ matrix.job.name }}/debian/control
-          cd debian-build/${{ matrix.job.name }}/
-          debuild -i -us -uc -b -a${{ matrix.job.debian_platform }}
+          chmod -v a+x debian-build/amd64/bin/*
+          cp -vr debian systemd debian-build/amd64/
+          sed 's/{{ ARCH }}/amd64/' debian/control.tpl > debian-build/amd64/debian/control
+          cd debian-build/amd64/
+          debuild -i -us -uc -b -aamd64
 
       - name: Publish Debian packages
         uses: actions/upload-artifact@v4
         with:
-          name: release-deb-${{ matrix.job.name }}
+          name: release-deb-amd64
           path: |
-            debian-build/rustdesk-server-hbbr_*_${{ matrix.job.debian_platform }}.deb
-            debian-build/rustdesk-server-hbbs_*_${{ matrix.job.debian_platform }}.deb
-            debian-build/rustdesk-server-utils_*_${{ matrix.job.debian_platform }}.deb
+            debian-build/rustdesk-server-hbbr_*_amd64.deb
+            debian-build/rustdesk-server-hbbs_*_amd64.deb
+            debian-build/rustdesk-server-utils_*_amd64.deb
           if-no-files-found: error
 
   release:
     name: Publish GitHub Release
     needs:
       - prepare
-      - package-binaries
+      - package-binary
       - deb-package
     runs-on: ubuntu-22.04
     steps:
