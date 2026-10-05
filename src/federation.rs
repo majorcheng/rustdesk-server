@@ -13,7 +13,7 @@ use hbb_common::{
         time::{sleep, Duration},
     },
     tokio_util::codec::Framed,
-    ResultType,
+    try_into_v4, ResultType,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -69,6 +69,8 @@ enum Message {
     },
     HelloAck {
         node_id: String,
+        #[serde(default)]
+        relay_server: String,
     },
     Peer(PeerLease),
     PeerRemove {
@@ -294,13 +296,12 @@ impl Federation {
         source_addr: SocketAddr,
         target_id: Option<&str>,
     ) -> Option<RemoteRoute> {
+        let source_addr = try_into_v4(source_addr);
         let key = source_addr.to_string();
         let mut routes = self.routes.write().await;
         routes.retain(|_, route| route.expires_at > Instant::now());
-        if let Some(target_id) = target_id {
-            if let Some(route) = routes.get(&format!("{key}|{target_id}")) {
-                return Some(route.clone());
-            }
+        if let Some(target_id) = target_id.filter(|target_id| !target_id.is_empty()) {
+            return routes.get(&format!("{key}|{target_id}")).cloned();
         }
         routes.iter().find_map(|(route_key, route)| {
             if route_key.starts_with(&format!("{key}|")) {
@@ -312,6 +313,8 @@ impl Federation {
     }
 
     pub(crate) async fn remember_route(&self, route: RemoteRoute) {
+        let mut route = route;
+        route.source_addr = try_into_v4(route.source_addr);
         let key = format!("{}|{}", route.source_addr, route.target_id);
         self.routes.write().await.insert(key, route);
     }
@@ -385,6 +388,7 @@ impl Federation {
             &mut sink,
             &Message::HelloAck {
                 node_id: self.node_id.as_str().to_owned(),
+                relay_server: self.relay_server.as_str().to_owned(),
             },
         )
         .await?;
@@ -413,15 +417,18 @@ impl Federation {
         let second = hbb_common::timeout(CONNECT_TIMEOUT_MS, source.next())
             .await?
             .ok_or_else(|| hbb_common::anyhow::anyhow!("federation handshake closed"))??;
-        let node_id = match decode_plain(&second)? {
-            Message::HelloAck { node_id } if !node_id.is_empty() => node_id,
+        let (node_id, relay_server) = match decode_plain(&second)? {
+            Message::HelloAck {
+                node_id,
+                relay_server,
+            } if !node_id.is_empty() => (node_id, relay_server),
             _ => {
                 return Err(hbb_common::anyhow::anyhow!(
                     "invalid federation acknowledgement"
                 ))
             }
         };
-        self.run_link(node_id, String::new(), sink, source).await
+        self.run_link(node_id, relay_server, sink, source).await
     }
 
     async fn run_link<S, R>(
@@ -695,5 +702,48 @@ mod tests {
         payload.extend(ciphertext);
         let outer = serde_json::to_vec(&Message::Encrypted(payload)).unwrap();
         assert!(matches!(decode_wire(&outer, &key).unwrap(), Message::Ping));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn route_for_matches_ipv4_mapped_source_address() {
+        let (federation, _rx) = Federation::disabled();
+        let source_addr = "192.0.2.10:4000".parse().unwrap();
+        federation
+            .remember_route(RemoteRoute {
+                source_node: "A".to_owned(),
+                source_addr,
+                target_id: "123456789".to_owned(),
+                source_relay: "relay-a:21117".to_owned(),
+                expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            })
+            .await;
+
+        assert!(federation
+            .route_for(
+                "[::ffff:192.0.2.10]:4000".parse().unwrap(),
+                Some("123456789"),
+            )
+            .await
+            .is_some());
+        assert!(federation
+            .route_for("192.0.2.10:4000".parse().unwrap(), Some("987654321"))
+            .await
+            .is_none());
+        assert!(federation
+            .route_for("192.0.2.10:4000".parse().unwrap(), Some(""))
+            .await
+            .is_some());
+    }
+
+    #[test]
+    fn hello_ack_without_relay_server_is_backward_compatible() {
+        let encoded = br#"{"HelloAck":{"node_id":"A"}}"#;
+        assert!(matches!(
+            decode_plain(encoded).unwrap(),
+            Message::HelloAck {
+                node_id,
+                relay_server
+            } if node_id == "A" && relay_server.is_empty()
+        ));
     }
 }

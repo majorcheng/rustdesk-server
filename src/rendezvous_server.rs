@@ -502,10 +502,28 @@ impl RendezvousServer {
                     // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    let source_addr = AddrMangle::decode(&phs.socket_addr);
+                    let has_route = !phs.id.is_empty()
+                        && self
+                            .federation
+                            .route_for(source_addr, Some(&phs.id))
+                            .await
+                            .is_some();
+                    if has_route {
+                        allow_err!(self.handle_hole_sent(phs, addr, Some(socket)).await);
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
+                    let source_addr = AddrMangle::decode(&la.socket_addr);
+                    let has_route = !la.id.is_empty()
+                        && self
+                            .federation
+                            .route_for(source_addr, Some(&la.id))
+                            .await
+                            .is_some();
+                    if has_route {
+                        allow_err!(self.handle_local_addr(la, addr, Some(socket)).await);
+                    }
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -585,7 +603,7 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
-                    let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    let addr_b = relay_response_source_addr(&rr);
                     if let Ok(true) = self.forward_relay_response(addr_b, rr.clone()).await {
                         return true;
                     }
@@ -702,7 +720,8 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
-        if let Some(route) = self.federation.route_for(addr_a, Some(&phs.id)).await {
+        let route = self.federation.route_for(addr_a, Some(&phs.id)).await;
+        if let Some(route) = route {
             let mut msg_out = RendezvousMessage::new();
             let mut p = PunchHoleResponse {
                 socket_addr: AddrMangle::encode(addr).into(),
@@ -763,7 +782,8 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
-        if let Some(route) = self.federation.route_for(addr_a, Some(&la.id)).await {
+        let route = self.federation.route_for(addr_a, Some(&la.id)).await;
+        if let Some(route) = route {
             let mut msg_out = RendezvousMessage::new();
             let mut p = PunchHoleResponse {
                 socket_addr: la.local_addr.clone(),
@@ -1143,7 +1163,7 @@ impl RendezvousServer {
                 target_id: message.target_id.clone(),
                 source_relay: message.source_relay.clone(),
                 expires_at: Instant::now() + std::time::Duration::from_secs(60),
-            })
+        })
             .await;
         let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
         self.send_to_client(msg, peer_addr, socket).await
@@ -1183,11 +1203,12 @@ impl RendezvousServer {
         if let Some(rendezvous_message::Union::PunchHoleResponse(response)) = msg.union.as_mut() {
             response.relay_server = route.source_relay.clone();
         }
+        let target_node = forward_message_target_node(&route).to_owned();
         self.federation
             .send_forward(ForwardMessage {
                 kind: ForwardKind::ToSource,
                 source_node: self.federation.node_id().to_owned(),
-                target_node: route.source_node,
+                target_node,
                 source_addr: route.source_addr,
                 target_id: route.target_id,
                 source_relay: route.source_relay,
@@ -1293,10 +1314,13 @@ impl RendezvousServer {
 
     async fn forward_relay_response(
         &mut self,
-        addr: SocketAddr,
+        source_addr: SocketAddr,
         mut rr: RelayResponse,
     ) -> ResultType<bool> {
-        let route = self.federation.route_for(addr, Some(rr.id())).await;
+        let route = self
+            .federation
+            .route_for(source_addr, Some(rr.id()))
+            .await;
         let Some(route) = route else {
             return Ok(false);
         };
@@ -1828,6 +1852,14 @@ async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType
     Ok(s)
 }
 
+fn forward_message_target_node(message: &ForwardMessage) -> &str {
+    message.target_node.as_str()
+}
+
+fn relay_response_source_addr(response: &RelayResponse) -> SocketAddr {
+    AddrMangle::decode(&response.socket_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1837,5 +1869,34 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn relay_response_route_uses_encoded_source_address() {
+        let response = RelayResponse {
+            socket_addr: vec![
+                0x2c, 0xc5, 0x06, 0x0c, 0xb2, 0x2e, 0xc3, 0x13, 0x37, 0x83, 0x01,
+            ]
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            relay_response_source_addr(&response),
+            "222.131.66.42:48937".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn to_source_forward_uses_route_target_node() {
+        let route = ForwardMessage {
+            kind: ForwardKind::ToSource,
+            source_node: "A".to_owned(),
+            target_node: "B".to_owned(),
+            source_addr: String::new(),
+            target_id: String::new(),
+            source_relay: String::new(),
+            payload: Vec::new(),
+        };
+        assert_eq!(forward_message_target_node(&route), "B");
     }
 }
