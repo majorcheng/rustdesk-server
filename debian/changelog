@@ -1,3 +1,12 @@
+rustdesk-server (1.1.18) UNRELEASED; urgency=medium
+
+  * Fix cross-node federation response routing and synchronize relay addresses.
+  * Normalize federation route addresses and restrict UDP response forwarding
+    to matching routes.
+  * Synchronize Cargo lockfile and packaging versions for the 1.1.18 release.
+
+ -- majorcheng <major@thu.cn>  Mon, 05 Oct 2026 23:27:17 +0800
+
 rustdesk-server (1.1.17) UNRELEASED; urgency=medium
 
   * Fix more UDP reflection/amplification

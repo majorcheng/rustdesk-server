@@ -34,3 +34,13 @@ Mac(A) 连接成功。B 的 `hbbr` 文件日志在 20:51 服务重启后未追�
 
 影响范围：`.github/workflows/build.yaml`、Linux binary/DEB Release 资产。
 完成标准：Release 至少包含 Linux amd64 binary 压缩包和 `rustdesk-server-*.deb`，且 workflow 不依赖 Docker secrets 或跨编译容器。
+
+# 修复 1.1.18 Release 版本一致性
+
+- [x] 核对失败 Actions、所有发布版本来源及当前分支，复现锁文件不一致错误
+- [x] 同步 Debian changelog、Cargo.lock 和安装器版本，去除手动发布表单的过期默认标签
+- [x] 验证工作流版本校验、Debian 版本解析和 CI 同参数的 Linux release 构建
+- [x] 完成详细中文提交并推送 master，由用户手动运行 Actions
+
+影响范围：`Cargo.lock`、`debian/changelog`、`ui/setup.nsi`、`.github/workflows/build.yaml`。
+完成标准：发布标签、Cargo 包、二进制与 Debian 包元数据均为 `1.1.18`，`--locked` 构建通过；不触发 Actions 或创建发布标签。
