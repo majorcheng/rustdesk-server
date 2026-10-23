@@ -80,9 +80,9 @@ BDD 验收场景：
 - [x] 让远端租约仅覆盖已过期的本地 Peer，并统一在线判断使用的注册超时
 - [x] 增加数据库过期记录和新鲜本地记录的回归测试
 - [x] 运行聚焦测试、库测试、锁定构建和差异检查
-- [ ] 创建中文提交并推送现有 `origin/master`
+- [x] 创建中文提交并推送现有 `origin/master`
 
 影响范围：`src/peer.rs`、`src/rendezvous_server.rs`、本记录。
 完成标准：上述两个场景通过；联邦在线判断继续使用同一超时契约；不修改生产 A/B 配置或服务状态。
 
-验证记录：`cargo test --locked --lib` 通过（19 passed）；`cargo test --locked --test protobuf_recursion` 通过（1 passed）；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。未部署或重启 A/B。
+验证记录：`cargo test --locked --lib` 通过（19 passed）；`cargo test --locked --test protobuf_recursion` 通过（1 passed）；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。修复提交 `ad39609` 已推送到 `origin/master`；未部署或重启 A/B。
