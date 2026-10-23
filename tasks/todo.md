@@ -44,3 +44,16 @@ Mac(A) 连接成功。B 的 `hbbr` 文件日志在 20:51 服务重启后未追�
 
 影响范围：`Cargo.lock`、`debian/changelog`、`ui/setup.nsi`、`.github/workflows/build.yaml`。
 完成标准：发布标签、Cargo 包、二进制与 Debian 包元数据均为 `1.1.18`，`--locked` 构建通过；不触发 Actions 或创建发布标签。
+
+# 跟进上游 2026-10 修复
+
+- [x] 合并上游 `5e37f45` 打洞请求内存上限与 peer ID 长度修复
+- [x] 合并上游 `873230e` 密钥文件权限、原子公钥写入与错误传播修复
+- [x] 解决 `src/relay_server.rs`、`src/rendezvous_server.rs` 冲突，保留本地联邦与 Relay 上游逻辑
+- [x] 完成依赖、文档、回归测试和 release 构建验证
+- [x] 创建中文合并提交并推送现有 `origin/master`
+
+影响范围：`src/common.rs`、`src/peer.rs`、`src/rendezvous_server.rs`、`src/relay_server.rs`、`Cargo.toml`、`Cargo.lock`、`docs/environment-variables.md`、测试和本记录。
+完成标准：上游两组修复进入自有 `master`；`1.1.18`、联邦、Relay 上游行为保留；锁定构建、库测试、协议回归测试和差异检查通过。
+
+验证记录：`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo test --locked --lib` 通过（17 passed）；同环境下 `cargo test --locked --test protobuf_recursion` 通过（1 passed）；`cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。
