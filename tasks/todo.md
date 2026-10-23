@@ -69,3 +69,20 @@ Mac(A) 连接成功。B 的 `hbbr` 文件日志在 20:51 服务重启后未追�
 完成标准：workflow 输入 `v1.1.19` 时与 Cargo 和 Debian 首条版本记录一致；锁定构建继续通过；历史 `1.1.18` 记录保留。
 
 验证记录：workflow 等价版本校验通过；`dpkg-parsechangelog --count 1 --show-field Version` 输出 `1.1.19`；`cargo metadata --locked --no-deps` 返回 `hbbs 1.1.19`；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。
+
+# 修复联邦过期本地 Peer 阻塞
+
+BDD 验收场景：
+
+- 当 B 从数据库载入的 Peer 已超过注册超时，随后收到 A 的有效租约时，B 将该 Peer owner 更新为 A，并能把它作为在线远端 Peer 路由。
+- 当 B 的本地 Peer 仍在注册超时内，收到 A 的同 ID 租约时，B 保留本地 owner、地址和密钥，不被远端租约抢占。
+
+- [x] 让远端租约仅覆盖已过期的本地 Peer，并统一在线判断使用的注册超时
+- [x] 增加数据库过期记录和新鲜本地记录的回归测试
+- [x] 运行聚焦测试、库测试、锁定构建和差异检查
+- [ ] 创建中文提交并推送现有 `origin/master`
+
+影响范围：`src/peer.rs`、`src/rendezvous_server.rs`、本记录。
+完成标准：上述两个场景通过；联邦在线判断继续使用同一超时契约；不修改生产 A/B 配置或服务状态。
+
+验证记录：`cargo test --locked --lib` 通过（19 passed）；`cargo test --locked --test protobuf_recursion` 通过（1 passed）；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。未部署或重启 A/B。

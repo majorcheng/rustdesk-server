@@ -50,7 +50,6 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
@@ -873,7 +872,7 @@ impl RendezvousServer {
                 let r = peer.read().await;
                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
-            if elapsed >= REG_TIMEOUT {
+            if elapsed >= PEER_REG_TIMEOUT_MS {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -960,7 +959,7 @@ impl RendezvousServer {
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
-                if elapsed < REG_TIMEOUT {
+                if elapsed < PEER_REG_TIMEOUT_MS {
                     states[states_idx] |= 0x01 << bit_idx;
                 }
             }
@@ -1162,7 +1161,7 @@ impl RendezvousServer {
                 peer.last_reg_time.elapsed().as_millis() as i64,
             )
         };
-        if owner != self.federation.node_id() || elapsed >= REG_TIMEOUT {
+        if owner != self.federation.node_id() || elapsed >= PEER_REG_TIMEOUT_MS {
             return self
                 .forward_failure(message, punch_hole_response::Failure::OFFLINE)
                 .await;
@@ -1265,7 +1264,9 @@ impl RendezvousServer {
             return Ok(());
         };
         if let Some(peer) = self.pm.get(&target_id).await {
-            if peer.read().await.last_reg_time.elapsed().as_millis() as i64 >= REG_TIMEOUT {
+            if peer.read().await.last_reg_time.elapsed().as_millis() as i64
+                >= PEER_REG_TIMEOUT_MS
+            {
                 let mut msg = RendezvousMessage::new();
                 msg.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),

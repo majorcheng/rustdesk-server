@@ -26,6 +26,7 @@ pub const IP_BLOCK_DUR: u64 = 60;
 // Same bound as the Pro server: a longer id is not a normal RustDesk id or hostname,
 // and every peer entry and punch-request record keeps its own copy.
 pub const MAX_PEER_ID_LEN: usize = 253;
+pub(crate) const PEER_REG_TIMEOUT_MS: i64 = 30_000;
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
@@ -158,8 +159,8 @@ impl PeerMap {
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
-            return Some(peer);
+            let mut map = self.map.write().await;
+            return Some(map.entry(id.to_owned()).or_insert(peer).clone());
         }
         None
     }
@@ -212,7 +213,9 @@ impl PeerMap {
                 .clone()
         };
         let mut peer = peer.write().await;
-        if peer.owner == self.local_node {
+        if peer.owner == self.local_node
+            && (peer.last_reg_time.elapsed().as_millis() as i64) < PEER_REG_TIMEOUT_MS
+        {
             return;
         }
         peer.socket_addr = "0.0.0.0:0".parse().unwrap_or(peer.socket_addr);
@@ -277,5 +280,86 @@ impl PeerMap {
             }
         }
         snapshots
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio;
+
+    async fn test_peer_map() -> (PeerMap, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer.sqlite3");
+        let db = database::Database::new(path.to_str().unwrap()).await.unwrap();
+        (
+            PeerMap {
+                map: Default::default(),
+                db,
+                local_node: "B".to_owned(),
+            },
+            directory,
+        )
+    }
+
+    fn remote_lease(id: &str) -> PeerLease {
+        PeerLease {
+            id: id.to_owned(),
+            uuid: vec![2],
+            pk: vec![3],
+            ip: "36.112.108.165".to_owned(),
+        }
+    }
+
+    #[hbb_common::tokio::test]
+    async fn expired_database_peer_accepts_remote_lease() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "428172967";
+        peer_map
+            .db
+            .insert_peer(id, &[1], &[1], r#"{"ip":"123.116.41.115"}"#)
+            .await
+            .unwrap();
+
+        let peer = peer_map.get(id).await.expect("database peer should load");
+        assert_eq!(peer.read().await.owner, "B");
+
+        peer_map.upsert_remote("A".to_owned(), remote_lease(id)).await;
+
+        let peer = peer_map.get_in_memory(id).await.expect("peer should remain");
+        let peer = peer.read().await;
+        assert_eq!(peer.owner, "A");
+        assert_eq!(peer.info.ip, "36.112.108.165");
+        assert_eq!(peer_map.remote_owner(id).await.as_deref(), Some("A"));
+        assert!((peer.last_reg_time.elapsed().as_millis() as i64) < PEER_REG_TIMEOUT_MS);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn fresh_local_peer_keeps_local_lease() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "488257584";
+        let peer = Arc::new(RwLock::new(Peer {
+            socket_addr: "222.131.66.42:21116".parse().unwrap(),
+            last_reg_time: Instant::now(),
+            uuid: vec![1].into(),
+            pk: vec![1].into(),
+            info: PeerInfo {
+                ip: "222.131.66.42".to_owned(),
+            },
+            owner: "B".to_owned(),
+            ..Default::default()
+        }));
+        peer_map.map.write().await.insert(id.to_owned(), peer);
+
+        peer_map.upsert_remote("A".to_owned(), remote_lease(id)).await;
+
+        let peer = peer_map.get_in_memory(id).await.expect("peer should remain");
+        let peer = peer.read().await;
+        assert_eq!(peer.owner, "B");
+        assert_eq!(peer.socket_addr, "222.131.66.42:21116".parse().unwrap());
+        assert_eq!(peer.uuid.as_ref(), [1].as_slice());
+        assert_eq!(peer.pk.as_ref(), [1].as_slice());
+        assert_eq!(peer.info.ip, "222.131.66.42");
+        assert!(peer_map.remote_owner(id).await.is_none());
     }
 }
