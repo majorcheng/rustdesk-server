@@ -57,3 +57,15 @@ Mac(A) 连接成功。B 的 `hbbr` 文件日志在 20:51 服务重启后未追�
 完成标准：上游两组修复进入自有 `master`；`1.1.18`、联邦、Relay 上游行为保留；锁定构建、库测试、协议回归测试和差异检查通过。
 
 验证记录：`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo test --locked --lib` 通过（17 passed）；同环境下 `cargo test --locked --test protobuf_recursion` 通过（1 passed）；`cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。
+
+# 准备 1.1.19 Release
+
+- [x] 定位 workflow 版本校验失败并核对当前分支、远端和所有发布版本来源
+- [x] 同步 Cargo、锁文件、Debian changelog 和 Windows 安装器到 `1.1.19`
+- [x] 验证 workflow 版本校验、锁定元数据和 release 构建
+- [x] 创建中文提交并推送 `master`，再运行 `v1.1.19` Release workflow
+
+影响范围：`Cargo.toml`、`Cargo.lock`、`debian/changelog`、`ui/setup.nsi` 和本记录。
+完成标准：workflow 输入 `v1.1.19` 时与 Cargo 和 Debian 首条版本记录一致；锁定构建继续通过；历史 `1.1.18` 记录保留。
+
+验证记录：workflow 等价版本校验通过；`dpkg-parsechangelog --count 1 --show-field Version` 输出 `1.1.19`；`cargo metadata --locked --no-deps` 返回 `hbbs 1.1.19`；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。

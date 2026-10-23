@@ -1,3 +1,10 @@
+rustdesk-server (1.1.19) UNRELEASED; urgency=medium
+
+  * Synchronize upstream key-file permission and punch-request hardening fixes.
+  * Synchronize Cargo, Debian, and Windows package metadata for the 1.1.19 release.
+
+ -- majorcheng <major@thu.cn>  Fri, 23 Oct 2026 23:39:33 +0800
+
 rustdesk-server (1.1.18) UNRELEASED; urgency=medium
 
   * Fix cross-node federation response routing and synchronize relay addresses.
