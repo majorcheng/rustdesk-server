@@ -1,3 +1,14 @@
+rustdesk-server (1.1.20) UNRELEASED; urgency=medium
+
+  * Require a fresh registration and a routable address before forwarding
+    RequestRelay over UDP, so stale peers can no longer poison the socket.
+  * Refuse relay requests for unknown or offline peers with an explicit
+    RelayResponse instead of leaving the client waiting for a timeout.
+  * Rebuild the UDP listener only after a send failure left a frame buffered,
+    and report it separately from listener errors.
+
+ -- majorcheng <major@thu.cn>  Sat, 31 Oct 2026 16:20:00 +0800
+
 rustdesk-server (1.1.19) UNRELEASED; urgency=medium
 
   * Synchronize upstream key-file permission and punch-request hardening fixes.

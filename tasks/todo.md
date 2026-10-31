@@ -86,3 +86,23 @@ BDD 验收场景：
 完成标准：上述两个场景通过；联邦在线判断继续使用同一超时契约；不修改生产 A/B 配置或服务状态。
 
 验证记录：`cargo test --locked --lib` 通过（19 passed）；`cargo test --locked --test protobuf_recursion` 通过（1 passed）；`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`git diff --check` 通过。修复提交 `ad39609` 已推送到 `origin/master`；未部署或重启 A/B。
+
+# 修复 hbbs UDP 中继目标不可达
+
+BDD 验收场景：
+
+- 当数据库中的过期 Peer 没有可用的 UDP 地址时，客户端发起 RequestRelay，hbbs 不得把消息发往 `0.0.0.0:0`，而应返回带 `refuse_reason` 的 RelayResponse。
+- 当 Peer 注册仍在超时内且地址可路由时，RequestRelay 继续按原路径转发，行为不变。
+- 当联邦转发的目标 Peer 离线或不存在时，源节点收到 RelayResponse，而不是 PunchHoleResponse。
+- 当单条 UDP 报文的响应发送失败时，日志记录目标与原因，重建监听以清空 tokio-util 保留的失败帧。
+
+- [x] 为 Peer 增加“注册新鲜且地址可投递”的唯一判定，PunchHole 与 Relay 共用
+- [x] 中继请求对未知/离线 Peer 返回显式拒绝，联邦失败按请求类型返回对应响应
+- [x] 在 UDP 队列入队和发送前校验目标地址，区分单包错误与监听器错误
+- [x] 增加可达性判定和拒绝消息的回归测试
+- [x] 同步 1.1.20 版本元数据
+
+影响范围：`src/peer.rs`、`src/rendezvous_server.rs`、`Cargo.toml`、`Cargo.lock`、`debian/changelog`、`ui/setup.nsi`、本记录。
+完成标准：过期 Peer 不再产生 UDP 发送失败；单包失败不再触发周期性 UDP 重建；`v1.1.20` 版本校验通过；不修改生产配置或服务状态。
+
+验证记录：`OPENSSL_LIB_DIR=/usr/lib/x86_64-linux-gnu OPENSSL_INCLUDE_DIR=/usr cargo test --locked --lib` 通过（21 passed，含新增 2 个用例）；同环境 `cargo test --locked --test protobuf_recursion` 通过（1 passed）；`cargo build --locked --release --all-features --bin hbbs --bin hbbr --bin rustdesk-utils` 通过；`cargo metadata --locked --no-deps` 返回 `hbbs 1.1.20`；`dpkg-parsechangelog --count 1 --show-field Version` 输出 `1.1.20`；按 workflow 逻辑模拟 `v1.1.20` 版本校验通过；`git diff --check` 通过。未部署或重启任何生产服务。

@@ -320,7 +320,16 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
+                        Data::Msg(msg, addr) => {
+                            if !is_deliverable_addr(addr) {
+                                log::debug!("drop udp message to invalid destination {}", addr);
+                            } else if let Err(err) = socket.send(msg.as_ref(), addr).await {
+                                // tokio-util retries a failed frame on every later send,
+                                // so the socket must be rebuilt to clear it.
+                                log::warn!("udp send to {} failed: {}", addr, err);
+                                return LoopFailure::UdpSocket;
+                            }
+                        }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
@@ -333,8 +342,11 @@ impl RendezvousServer {
                 res = socket.next() => {
                     match res {
                         Some(Ok((bytes, addr))) => {
-                            if let Err(err) = self.handle_udp(&bytes, addr.into(), socket, key).await {
-                                log::error!("udp failure: {}", err);
+                            let addr: SocketAddr = addr.into();
+                            if let Err(err) = self.handle_udp(&bytes, addr, socket, key).await {
+                                // A failed send leaves its frame buffered inside
+                                // tokio-util, so rebuild the socket to clear it.
+                                log::warn!("udp message from {:?} not handled: {}", addr, err);
                                 return LoopFailure::UdpSocket;
                             }
                         }
@@ -611,12 +623,29 @@ impl RendezvousServer {
                     if self.pm.remote_owner(&rf.id).await.is_some() {
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         allow_err!(self.handle_remote_forward_request(addr, rf).await);
-                    } else if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
-                        let mut msg_out = RendezvousMessage::new();
-                        rf.socket_addr = AddrMangle::encode(addr).into();
-                        msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        return true;
+                    }
+                    let peer_addr = match self.pm.get_in_memory(&rf.id).await {
+                        Some(peer) => {
+                            let peer = peer.read().await;
+                            peer.is_reachable().then_some(peer.socket_addr)
+                        }
+                        None => None,
+                    };
+                    match peer_addr {
+                        Some(peer_addr) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            rf.socket_addr = AddrMangle::encode(addr).into();
+                            msg_out.set_request_relay(rf);
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
+                        None => {
+                            log::debug!("relay request for unreachable peer {} from {}", rf.id, addr);
+                            allow_err!(
+                                self.send_to_tcp_sync(relay_refusal("peer offline"), addr)
+                                    .await
+                            );
+                        }
                     }
                     return true;
                 }
@@ -868,11 +897,11 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr) = {
+            let (reachable, peer_addr) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
+                (r.is_reachable(), r.socket_addr)
             };
-            if elapsed >= PEER_REG_TIMEOUT_MS {
+            if !reachable {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     failure: punch_hole_response::Failure::OFFLINE.into(),
@@ -1147,23 +1176,20 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
         let source_addr = message.source_addr.parse::<SocketAddr>()?;
+        let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
         let peer = self.pm.get_in_memory(&message.target_id).await;
         let Some(peer) = peer else {
             return self
-                .forward_failure(message, punch_hole_response::Failure::ID_NOT_EXIST)
+                .forward_failure(message, &msg, punch_hole_response::Failure::ID_NOT_EXIST)
                 .await;
         };
-        let (peer_addr, owner, elapsed) = {
+        let (peer_addr, owner, reachable) = {
             let peer = peer.read().await;
-            (
-                peer.socket_addr,
-                peer.owner.clone(),
-                peer.last_reg_time.elapsed().as_millis() as i64,
-            )
+            (peer.socket_addr, peer.owner.clone(), peer.is_reachable())
         };
-        if owner != self.federation.node_id() || elapsed >= PEER_REG_TIMEOUT_MS {
+        if owner != self.federation.node_id() || !reachable {
             return self
-                .forward_failure(message, punch_hole_response::Failure::OFFLINE)
+                .forward_failure(message, &msg, punch_hole_response::Failure::OFFLINE)
                 .await;
         }
         self.federation
@@ -1175,7 +1201,6 @@ impl RendezvousServer {
                 expires_at: Instant::now() + std::time::Duration::from_secs(60),
         })
             .await;
-        let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
         self.send_to_client(msg, peer_addr, socket).await
     }
 
@@ -1192,13 +1217,27 @@ impl RendezvousServer {
     async fn forward_failure(
         &self,
         message: ForwardMessage,
+        request: &RendezvousMessage,
         failure: punch_hole_response::Failure,
     ) -> ResultType<()> {
         let mut msg = RendezvousMessage::new();
-        msg.set_punch_hole_response(PunchHoleResponse {
-            failure: failure.into(),
-            ..Default::default()
-        });
+        if matches!(
+            request.union,
+            Some(rendezvous_message::Union::RequestRelay(_))
+        ) {
+            let mut response = RelayResponse::new();
+            response.refuse_reason = match failure {
+                punch_hole_response::Failure::OFFLINE => "peer offline",
+                _ => "peer id does not exist",
+            }
+            .to_owned();
+            msg.set_relay_response(response);
+        } else {
+            msg.set_punch_hole_response(PunchHoleResponse {
+                failure: failure.into(),
+                ..Default::default()
+            });
+        }
         self.forward_response(message, msg).await
     }
 
@@ -1234,6 +1273,9 @@ impl RendezvousServer {
         addr: SocketAddr,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
+        if !is_deliverable_addr(addr) {
+            bail!("cannot send to invalid address {}", addr);
+        }
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         if sink.is_some() {
             Self::send_to_sink(&mut sink, msg).await;
@@ -1868,6 +1910,14 @@ fn forward_message_target_node(message: &ForwardMessage) -> &str {
     message.target_node.as_str()
 }
 
+fn relay_refusal(reason: &str) -> RendezvousMessage {
+    let mut msg = RendezvousMessage::new();
+    let mut response = RelayResponse::new();
+    response.refuse_reason = reason.to_owned();
+    msg.set_relay_response(response);
+    msg
+}
+
 fn relay_response_source_addr(response: &RelayResponse) -> SocketAddr {
     AddrMangle::decode(&response.socket_addr)
 }
@@ -1881,6 +1931,36 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn relay_refusal_is_a_relay_response() {
+        let msg = relay_refusal("peer offline");
+        match msg.union {
+            Some(rendezvous_message::Union::RelayResponse(response)) => {
+                assert_eq!(response.refuse_reason, "peer offline");
+            }
+            _ => panic!("relay refusal must be a RelayResponse"),
+        }
+    }
+
+    #[test]
+    fn peer_reachability_requires_fresh_registration_and_addr() {
+        let mut peer = Peer::default();
+        assert!(!peer.is_reachable());
+        peer.last_reg_time = Instant::now();
+        assert!(!peer.is_reachable());
+        peer.socket_addr = "192.0.2.10:21116".parse().unwrap();
+        assert!(peer.is_reachable());
+        peer.socket_addr = "0.0.0.0:0".parse().unwrap();
+        assert!(!peer.is_reachable());
+        peer.socket_addr = "[::]:21116".parse().unwrap();
+        assert!(!peer.is_reachable());
+        peer.socket_addr = "192.0.2.10:0".parse().unwrap();
+        assert!(!peer.is_reachable());
+        peer.socket_addr = "192.0.2.10:21116".parse().unwrap();
+        peer.last_reg_time = Instant::now() - Duration::from_millis(PEER_REG_TIMEOUT_MS as u64);
+        assert!(!peer.is_reachable());
     }
 
     #[test]

@@ -28,6 +28,10 @@ pub const IP_BLOCK_DUR: u64 = 60;
 pub const MAX_PEER_ID_LEN: usize = 253;
 pub(crate) const PEER_REG_TIMEOUT_MS: i64 = 30_000;
 
+pub(crate) fn is_deliverable_addr(addr: SocketAddr) -> bool {
+    addr.port() != 0 && !addr.ip().is_unspecified()
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub(crate) struct PeerInfo {
     #[serde(default)]
@@ -61,6 +65,16 @@ impl Default for Peer {
             reg_pk: (0, get_expired_time()),
             owner: String::new(),
         }
+    }
+}
+
+impl Peer {
+    // Database records and remote leases keep the 0.0.0.0:0 placeholder until
+    // the peer registers an address, so freshness alone is not enough to make
+    // it a usable request target.
+    pub(crate) fn is_reachable(&self) -> bool {
+        (self.last_reg_time.elapsed().as_millis() as i64) < PEER_REG_TIMEOUT_MS
+            && is_deliverable_addr(self.socket_addr)
     }
 }
 
