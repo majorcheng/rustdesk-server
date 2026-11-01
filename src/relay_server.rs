@@ -662,11 +662,19 @@ pub(crate) async fn make_pair_(
         return;
     }
     if is_bot && !options.upstream.quic_addr.is_empty() || !options.upstream.tcp_addr.is_empty() {
-        relay_upstream(stream, addr, options, limiter, bytes, is_bot).await;
+        relay_upstream(stream, addr, options, limiter, bytes, is_bot, transport).await;
         return;
     }
     if !request.uuid.is_empty() {
-        relay_local(stream, addr, limiter, request.uuid).await;
+        relay_local(stream, addr, limiter, request.uuid, transport).await;
+    }
+}
+
+fn transport_name(transport: Transport) -> &'static str {
+    match transport {
+        Transport::Tcp => "tcp",
+        Transport::WebSocket => "websocket",
+        Transport::Quic => "quic",
     }
 }
 
@@ -706,6 +714,7 @@ async fn relay_upstream(
     limiter: Limiter,
     bytes: BytesMut,
     is_bot: bool,
+    inbound: Transport,
 ) {
     let Some((mut peer, transport, fallback)) =
         open_upstream(options, is_bot, &mut stream, addr).await
@@ -713,8 +722,9 @@ async fn relay_upstream(
         return;
     };
     log::info!(
-        "Relay upstream transport={} fallback={} for {}",
+        "Relay upstream transport={} inbound={} fallback={} for {}",
         transport,
+        transport_name(inbound),
         fallback,
         addr
     );
@@ -778,14 +788,30 @@ async fn open_upstream(
     }
 }
 
-async fn relay_local(stream: impl StreamTrait, addr: SocketAddr, limiter: Limiter, uuid: String) {
+async fn relay_local(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    limiter: Limiter,
+    uuid: String,
+    transport: Transport,
+) {
     let stream = stream;
     let mut peer = PEERS.lock().await.remove(&uuid);
     if let Some(peer) = peer.as_mut() {
-        log::info!("Relayrequest {} from {} got paired", uuid, addr);
+        log::info!(
+            "Relayrequest {} from {} transport={} got paired",
+            uuid,
+            addr,
+            transport_name(transport)
+        );
         relay_pair(stream, peer, addr, limiter).await;
     } else {
-        log::info!("New relay request {} from {}", uuid, addr);
+        log::info!(
+            "New relay request {} from {} transport={}",
+            uuid,
+            addr,
+            transport_name(transport)
+        );
         PEERS.lock().await.insert(uuid.clone(), Box::new(stream));
         sleep(30.).await;
         PEERS.lock().await.remove(&uuid);
