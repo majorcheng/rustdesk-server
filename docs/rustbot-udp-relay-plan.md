@@ -683,15 +683,13 @@ RELAY_QUIC=Y
 RELAY_QUIC_BIND=0.0.0.0:21117     # Bot 腿 IPv4 即可
 RELAY_QUIC_CERT=/var/lib/rustdesk-server/relay-quic.crt.pem
 RELAY_QUIC_KEY=/var/lib/rustdesk-server/relay-quic.key.pem
-RELAY_UPSTREAM=relay-a.example.com:21117          # TCP 网络回落/stock
-RELAY_UPSTREAM_QUIC=[2001:db8::a]:21117           # ② QUIC，IPv6 优先
+RELAY_UPSTREAM=172.16.0.33:21117                 # TCP 回落/stock，走 tinc 内网
+RELAY_UPSTREAM_QUIC=[2408:400a:d9:5e00::8]:21117 # ② QUIC，A 的公网 IPv6（tinc 侧 A 没有 ULA 地址）
 RELAY_UPSTREAM_IPV6=prefer
-RELAY_UPSTREAM_QUIC_AUTH=pin                      # v1 只接受 pin
-RELAY_UPSTREAM_QUIC_PIN=sha256:<cluster-pin>   # 共用证书时与 Bot 侧同一个 pin
-RELAY_UPSTREAM_QUIC_SNI=relay-a.example.com       # 如用 IP 字面量
+RELAY_UPSTREAM_QUIC_AUTH=pin                     # v1 只接受 pin
+RELAY_UPSTREAM_QUIC_PIN=sha256:<cluster-pin>     # 共用证书时与 Bot 侧同一个 pin
 RELAY_UPSTREAM_QUIC_FALLBACK_ON_AUTH_ERROR=N
-RELAY_BOT_TOKEN_SECRET=<cluster-secret>
-# 可选：RELAY_UPSTREAM_BIND=[2001:db8::b]:0
+RELAY_BOT_TOKEN_SECRET=<cluster-secret>          # 与 Bot Deb 内置的 relay_token_secret 相同
 ```
 
 **RustBot(B)**
