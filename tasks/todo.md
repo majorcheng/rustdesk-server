@@ -1,3 +1,26 @@
+# QUIC relay 传输
+
+目标：RustBot 的 `RustBot(B) → relay(B) → relay(A) → RustBot(A)` 全链路可以走 QUIC/UDP，
+复用现有 hbbr 的 UUID 配对，原版 RustDesk 继续走 TCP。
+
+- [x] hbbr 新增 QUIC listener（`RELAY_QUIC`、`RELAY_QUIC_BIND`、`RELAY_QUIC_PORT`）
+- [x] hbbr edge 新增 QUIC upstream（`RELAY_UPSTREAM_QUIC`）与 IPv6 优先
+- [x] `RequestRelay.token` 做 bot/stock 分流，空 secret 时 fail closed
+- [x] pin 模式证书校验（`sha256:<base64 SHA-256(DER)>`），认证失败不回落 TCP
+- [x] `RELAY_ROLE` 校验，默认 `standalone` 保持既有部署行为
+- [x] 启动日志输出证书 pin，便于向 Bot 下发
+- [x] 同步 1.1.21 版本元数据
+
+影响范围：`src/quic_relay.rs`（新增）、`src/relay_server.rs`、`src/hbbr.rs`、`Cargo.toml`、
+`Cargo.lock`、`debian/changelog`、`ui/setup.nsi`、`docker-compose.yml`、`docker/Dockerfile`、
+`docs/environment-variables.md`、`docs/rustbot-udp-relay-plan.md`、本记录。
+完成标准：`v1.1.21` 版本校验通过；stock 客户端仍走原有 TCP 路径；开 QUIC 但缺 token secret 时启动失败。
+
+验证记录：`cargo test --locked --offline --bin hbbr` 通过（13 passed）；`cargo test --locked --offline --lib` 通过（21 passed）；
+`cargo build --locked --offline --release --bin hbbr` 通过；`dpkg-parsechangelog --count 1 --show-field Version` 输出 `1.1.21`；
+`cargo metadata --locked --no-deps` 返回 `hbbs 1.1.21`；证书生成/复用与 pin 计算已在本机验证并部署到 A/B。
+未跑真实三跳 E2E（需新版 hbbr 部署到 A/B 后验证）。
+
 # 中心化边缘节点联邦
 
 - [x] 增加 A 主控与 B/C/D 边缘节点的出站控制链路和 peer 租约同步

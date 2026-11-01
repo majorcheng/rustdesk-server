@@ -1,3 +1,21 @@
+rustdesk-server (1.1.21) UNRELEASED; urgency=medium
+
+  * Add an optional QUIC/UDP relay transport for RustBot peers, reusing the
+    existing hbbr UUID pairing so the relay stays a transparent byte pump.
+  * Authenticate RustBot relay requests with a per-UUID HMAC token carried in
+    RequestRelay.token; stock clients keep sending an empty token.
+  * Add RELAY-ROLE, RELAY-QUIC-*, RELAY-UPSTREAM-QUIC-* and
+    RELAY-BOT-TOKEN-SECRET, failing closed when QUIC is enabled without a
+    token secret. Existing deployments keep the standalone TCP behavior.
+  * Prefer IPv6 for the edge-to-master QUIC upstream and fall back to TCP only
+    on network failures; certificate, pin, ALPN and token failures never fall
+    back.
+  * Log the loaded QUIC relay certificate pin at startup so pins can be
+    distributed to clients.
+  * Publish the QUIC relay UDP port in the Docker image and compose file.
+
+ -- majorcheng <major@thu.cn>  Sun, 01 Nov 2026 19:55:00 +0800
+
 rustdesk-server (1.1.20) UNRELEASED; urgency=medium
 
   * Require a fresh registration and a routable address before forwarding

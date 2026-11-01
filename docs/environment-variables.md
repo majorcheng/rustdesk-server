@@ -111,6 +111,25 @@ ports.
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which the relay TCP and WebSocket listeners bind. Supported by `.env` and the inherited environment; `hbbr` does not support `--config`. |
 | `PORT` | `-p`, `--port` | `21117` | Relay listening port. `hbbr` also binds `PORT+2` for WebSocket relay. **Note:** when set via the `PORT` env var (not `-p`), `hbbr` listens on `PORT + 1`, so a shared `PORT=21116` makes `hbbs`=21116 and `hbbr`=21117. |
 | `RELAY-UPSTREAM` 🅴 | — | *(empty)* | Edge-only upstream Relay such as `relay-a.example.com:21117`. When set, the edge hbbr forwards each Relay session to the upstream hbbr while clients continue to connect to the local hbbr. |
+| `RELAY-ROLE` 🅴 | — | `standalone` | `standalone` keeps the existing behavior; `master` forbids an upstream; `edge` requires `RELAY-UPSTREAM` or `RELAY-UPSTREAM-QUIC`. |
+| `RELAY-QUIC` 🅴 | — | `N` | Enables the QUIC relay listener. Requires `RELAY-BOT-TOKEN-SECRET`. |
+| `RELAY-QUIC-BIND` 🅴 | — | `BIND` or `[::]` | Local IP for the QUIC listener. `[::]` binds dual-stack; `0.0.0.0` binds IPv4 only. |
+| `RELAY-QUIC-PORT` 🅴 | — | `PORT` | UDP port for QUIC; defaults to the same numeric port as the TCP relay. |
+| `RELAY-QUIC-CERT` / `RELAY-QUIC-KEY` 🅴 | — | generated `relay-quic.crt.pem` / `.key.pem` | PEM server certificate and key. If both are absent, hbbr generates and persists them relative to its working directory, which is `/var/lib/rustdesk-server/` for the packaged systemd unit. The pin of the loaded certificate is logged at startup. A single certificate shared by every relay in the cluster keeps one pin for all clients and is required when bot configuration is rolled out through a single package; per-relay certificates isolate the blast radius instead. |
+| `RELAY-UPSTREAM-QUIC` 🅴 | — | *(empty)* | Edge-only QUIC upstream, for example `[2001:db8::a]:21117`. IPv6 is preferred. |
+| `RELAY-UPSTREAM-IPV6` 🅴 | — | `prefer` | `prefer`, `only`, or `off` for the QUIC upstream address family. |
+| `RELAY-UPSTREAM-QUIC-AUTH` 🅴 | — | `pin` | Server authentication mode. v1 only supports `pin`. |
+| `RELAY-UPSTREAM-QUIC-PIN` 🅴 | — | *(empty)* | Upstream certificate pin: `sha256:<standard-base64 SHA-256(DER certificate)>`. Required when `RELAY-UPSTREAM-QUIC` is set. |
+| `RELAY-UPSTREAM-QUIC-SNI` 🅴 | — | *(empty)* | SNI used for an IP-literal upstream. Pin mode ignores hostname/SAN but still requires a valid SNI string. |
+| `RELAY-UPSTREAM-QUIC-FALLBACK-ON-AUTH-ERROR` 🅴 | — | `N` | v1 requires `N`: certificate/pin/ALPN/token failures do not fall back to TCP; only network failures do. |
+| `RELAY-BOT-TOKEN-SECRET` 🅴 | — | *(empty)* | HMAC secret for RustBot data-plane relay tokens. Required when the QUIC listener is enabled or `RELAY-UPSTREAM-QUIC` is configured. |
+| `RELAY-QUIC-MAX-CONN` / `RELAY-QUIC-MAX-CONN-PER-IP` 🅴 | — | `10000` / `64` | Global and per-IP QUIC connection limits. |
+
+> QUIC v1 is pin-only. The relay certificate should be self-signed (the generated default
+> is); a CA-signed certificate is reserved for a future `ca` mode. A pin mismatch, expired
+> certificate, TLS signature failure, or ALPN mismatch fails the current session and does
+> **not** fall back to TCP; only network unavailability falls back. `RELAY-ROLE=standalone`
+> is the default, so existing hbbr deployments do not need to configure it.
 
 ### Relay bandwidth / QoS
 

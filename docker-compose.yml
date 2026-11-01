@@ -26,6 +26,7 @@ services:
     container_name: hbbr
     ports:
       - 21117:21117
+      - 21117:21117/udp
       - 21119:21119
     image: rustdesk/rustdesk-server:latest
     command: hbbr

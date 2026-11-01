@@ -1,7 +1,7 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use hbb_common::{
-    allow_err, bail,
+    allow_err, anyhow, bail,
     bytes::{Bytes, BytesMut},
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
@@ -25,8 +25,14 @@ use std::{
     io::prelude::*,
     io::Error,
     net::{IpAddr, SocketAddr},
-    sync::atomic::{AtomicUsize, Ordering},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
+
+use crate::quic_relay::{self, IpPreference};
 
 type Usage = (usize, usize, usize, usize);
 
@@ -45,69 +51,231 @@ static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // i
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transport {
+    Tcp,
+    WebSocket,
+    Quic,
+}
+
+#[derive(Clone)]
+pub(crate) struct UpstreamConfig {
+    pub(crate) quic_addr: String,
+    pub(crate) tcp_addr: String,
+    pub(crate) pin: Option<[u8; 32]>,
+    pub(crate) sni: String,
+    pub(crate) ipv6: IpPreference,
+}
+
+pub(crate) struct RelayOptions {
+    pub(crate) key: String,
+    pub(crate) token_secret: String,
+    pub(crate) upstream: UpstreamConfig,
+}
+
+#[derive(Clone)]
+struct QuicListenerConfig {
+    enabled: bool,
+    bind: Option<IpAddr>,
+    port: u16,
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+}
+
 #[tokio::main(flavor = "multi_thread")]
-pub async fn start_with_bind(
-    bind_addr: Option<IpAddr>,
-    port: &str,
-    key: &str,
-) -> ResultType<()> {
-    let key = get_server_sk(key)?;
-    let upstream = crate::common::get_arg("RELAY_UPSTREAM");
-    if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split('\n') {
-                if let Some(ip) = x.trim().split(' ').next() {
-                    BLACKLIST.write().await.insert(ip.to_owned());
-                }
-            }
-        }
-    }
-    log::info!(
-        "#blacklist({}): {}",
-        BLACKLIST_FILE,
-        BLACKLIST.read().await.len()
-    );
-    if let Ok(mut file) = std::fs::File::open(BLOCKLIST_FILE) {
-        let mut contents = String::new();
-        if file.read_to_string(&mut contents).is_ok() {
-            for x in contents.split('\n') {
-                if let Some(ip) = x.trim().split(' ').next() {
-                    BLOCKLIST.write().await.insert(ip.to_owned());
-                }
-            }
-        }
-    }
-    log::info!(
-        "#blocklist({}): {}",
-        BLOCKLIST_FILE,
-        BLOCKLIST.read().await.len()
-    );
+pub async fn start_with_bind(bind_addr: Option<IpAddr>, port: &str, key: &str) -> ResultType<()> {
+    load_blocklists().await;
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
-    let port2 = port + 2;
-    log::info!("Listening on websocket :{}", port2);
-    if !upstream.is_empty() {
-        log::info!("Relay upstream: {}", upstream);
-    }
-    let main_task = async move {
-        loop {
-            log::info!("Start");
-            io_loop(
-                crate::common::listen_tcp(bind_addr, port).await?,
-                crate::common::listen_tcp(bind_addr, port2).await?,
-                crate::common::listen_console(bind_addr, port).await?,
-                &key,
-                &upstream,
-            )
-            .await;
-        }
-    };
+    log::info!("Listening on websocket :{}", port + 2);
+    let key = get_server_sk(key)?;
+    let (options, quic) = build_runtime_options(bind_addr, port, key)?;
+    check_params();
+    let limiter = Limiter::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     let listen_signal = crate::common::listen_signal();
     tokio::select!(
-        res = main_task => res,
+        res = run_tcp_loop(bind_addr, port, options.clone(), limiter.clone()) => res,
+        res = run_quic_loop(quic, options, limiter) => res,
         res = listen_signal => res,
     )
+}
+
+async fn load_blocklists() {
+    load_ip_list(BLACKLIST_FILE, &BLACKLIST).await;
+    load_ip_list(BLOCKLIST_FILE, &BLOCKLIST).await;
+}
+
+async fn load_ip_list(file_name: &str, list: &RwLock<HashSet<String>>) {
+    if let Ok(mut file) = std::fs::File::open(file_name) {
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_ok() {
+            for line in contents.lines() {
+                if let Some(ip) = line.trim().split(' ').next() {
+                    list.write().await.insert(ip.to_owned());
+                }
+            }
+        }
+    }
+    log::info!("#{}: {}", file_name, list.read().await.len());
+}
+
+fn build_runtime_options(
+    bind_addr: Option<IpAddr>,
+    port: u16,
+    key: String,
+) -> ResultType<(Arc<RelayOptions>, QuicListenerConfig)> {
+    let upstream_tcp = crate::common::get_arg("RELAY_UPSTREAM");
+    let upstream_quic = crate::common::get_arg("RELAY_UPSTREAM_QUIC");
+    let token_secret = crate::common::get_arg("RELAY_BOT_TOKEN_SECRET");
+    let quic_enabled = parse_flag("RELAY_QUIC");
+    let pin = quic_relay::parse_pin(&crate::common::get_arg("RELAY_UPSTREAM_QUIC_PIN"))?;
+    let auth = crate::common::get_arg("RELAY_UPSTREAM_QUIC_AUTH");
+    let fallback_on_auth_error = parse_flag("RELAY_UPSTREAM_QUIC_FALLBACK_ON_AUTH_ERROR");
+    if (quic_enabled || !upstream_quic.is_empty()) && token_secret.is_empty() {
+        bail!("RELAY_BOT_TOKEN_SECRET is required when QUIC relay is enabled");
+    }
+    if !auth.is_empty() && auth != "pin" {
+        bail!("RELAY_UPSTREAM_QUIC_AUTH only supports pin in v1");
+    }
+    if !upstream_quic.is_empty() && pin.is_none() {
+        bail!("RELAY_UPSTREAM_QUIC_PIN is required when RELAY_UPSTREAM_QUIC is set");
+    }
+    if fallback_on_auth_error {
+        bail!("RELAY_UPSTREAM_QUIC_FALLBACK_ON_AUTH_ERROR is not supported in v1");
+    }
+    validate_role(&upstream_tcp, &upstream_quic)?;
+    let sni = crate::common::get_arg("RELAY_UPSTREAM_QUIC_SNI");
+    let ipv6 = IpPreference::from_arg(&crate::common::get_arg("RELAY_UPSTREAM_IPV6"));
+    if !upstream_quic.is_empty() {
+        log::info!(
+            "Relay upstream quic: {} (sni={}, ipv6={:?}, auth=pin)",
+            upstream_quic,
+            sni,
+            ipv6
+        );
+    }
+    let options = Arc::new(RelayOptions {
+        key,
+        token_secret,
+        upstream: UpstreamConfig {
+            quic_addr: upstream_quic,
+            tcp_addr: upstream_tcp,
+            pin,
+            sni,
+            ipv6,
+        },
+    });
+    let config = QuicListenerConfig {
+        enabled: quic_enabled,
+        bind: parse_quic_bind(&crate::common::get_arg("RELAY_QUIC_BIND"))?.or(bind_addr),
+        port: crate::common::get_arg("RELAY_QUIC_PORT")
+            .parse::<u16>()
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(port),
+        cert: path_arg("RELAY_QUIC_CERT"),
+        key: path_arg("RELAY_QUIC_KEY"),
+    };
+    Ok((options, config))
+}
+
+fn validate_role(upstream_tcp: &str, upstream_quic: &str) -> ResultType<()> {
+    match crate::common::get_arg("RELAY_ROLE")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "standalone" => Ok(()),
+        "master" if upstream_tcp.is_empty() && upstream_quic.is_empty() => Ok(()),
+        "master" => bail!("RELAY_ROLE=master must not configure an upstream"),
+        "edge" if !upstream_tcp.is_empty() || !upstream_quic.is_empty() => Ok(()),
+        "edge" => bail!("RELAY_ROLE=edge requires an upstream"),
+        role => bail!("invalid RELAY_ROLE: {role}"),
+    }
+}
+
+async fn run_tcp_loop(
+    bind_addr: Option<IpAddr>,
+    port: u16,
+    options: Arc<RelayOptions>,
+    limiter: Limiter,
+) -> ResultType<()> {
+    loop {
+        log::info!("Start");
+        io_loop(
+            crate::common::listen_tcp(bind_addr, port).await?,
+            crate::common::listen_tcp(bind_addr, port + 2).await?,
+            crate::common::listen_console(bind_addr, port).await?,
+            options.clone(),
+            limiter.clone(),
+        )
+        .await;
+    }
+}
+
+async fn run_quic_loop(
+    config: QuicListenerConfig,
+    options: Arc<RelayOptions>,
+    limiter: Limiter,
+) -> ResultType<()> {
+    if !config.enabled {
+        return std::future::pending().await;
+    }
+    loop {
+        if let Err(err) = quic_relay::start_listener(
+            config.bind,
+            config.port,
+            config.cert.clone(),
+            config.key.clone(),
+            options.clone(),
+            limiter.clone(),
+        )
+        .await
+        {
+            log::error!("quic listener failed: {}", err);
+        }
+        sleep(1.).await;
+    }
+}
+
+fn parse_flag(name: &str) -> bool {
+    matches!(
+        crate::common::get_arg(name)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "y" | "yes" | "true"
+    )
+}
+
+fn path_arg(name: &str) -> Option<PathBuf> {
+    let value = crate::common::get_arg(name);
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn parse_quic_bind(value: &str) -> ResultType<Option<IpAddr>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let value = if value.starts_with('[') {
+        value
+            .split(']')
+            .next()
+            .map(|value| value.trim_start_matches('['))
+            .unwrap_or(value)
+    } else if value.matches(':').count() > 1 {
+        value
+    } else {
+        value.split(':').next().unwrap_or(value)
+    };
+    Ok(Some(value.parse().map_err(|_| {
+        anyhow::anyhow!("invalid RELAY_QUIC_BIND: {value}")
+    })?))
 }
 
 fn check_params() {
@@ -342,18 +510,16 @@ async fn io_loop(
     listener: TcpListener,
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
-    key: &str,
-    upstream: &str,
+    options: Arc<RelayOptions>,
+    limiter: Limiter,
 ) {
-    check_params();
-    let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
     loop {
         tokio::select! {
             res = listener.accept() => {
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, upstream, false).await;
+                        handle_connection(stream, addr, &options, &limiter, false).await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -365,7 +531,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, upstream, true).await;
+                        handle_connection(stream, addr, &options, &limiter, true).await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -377,7 +543,7 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &limiter, key, upstream, false).await;
+                        handle_connection(stream, addr, &options, &limiter, false).await;
                     }
                     Err(err) => {
                        log::error!("console listener.accept failed: {}", err);
@@ -392,9 +558,8 @@ async fn io_loop(
 async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
+    options: &Arc<RelayOptions>,
     limiter: &Limiter,
-    key: &str,
-    upstream: &str,
     ws: bool,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
@@ -417,20 +582,22 @@ async fn handle_connection(
         log::info!("{} blocked", ip);
         return;
     }
-    let key = key.to_owned();
-    let upstream = upstream.to_owned();
+    let options = options.clone();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, &key, limiter, &upstream, ws).await);
+        allow_err!(make_pair(stream, addr, options, limiter, ws).await);
     });
+}
+
+pub(crate) async fn is_blocked(ip: IpAddr) -> bool {
+    BLOCKLIST.read().await.get(&ip.to_string()).is_some()
 }
 
 async fn make_pair(
     stream: TcpStream,
     mut addr: SocketAddr,
-    key: &str,
+    options: Arc<RelayOptions>,
     limiter: Limiter,
-    upstream: &str,
     ws: bool,
 ) -> ResultType<()> {
     if ws {
@@ -460,80 +627,190 @@ async fn make_pair(
             Ok(response)
         };
         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-        make_pair_(ws_stream, addr, key, limiter, upstream).await;
+        make_pair_(ws_stream, addr, &options, limiter, Transport::WebSocket).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, upstream).await;
+        make_pair_(
+            FramedStream::from(stream, addr),
+            addr,
+            &options,
+            limiter,
+            Transport::Tcp,
+        )
+        .await;
     }
     Ok(())
 }
 
-async fn make_pair_(
-    stream: impl StreamTrait,
+pub(crate) async fn make_pair_(
+    mut stream: impl StreamTrait,
     addr: SocketAddr,
-    key: &str,
+    options: &RelayOptions,
     limiter: Limiter,
-    upstream: &str,
+    transport: Transport,
 ) {
-    let mut stream = stream;
-    if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
-        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-            if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
-                if !key.is_empty() && rf.licence_key != key {
-                    log::warn!("Relay authentication failed from {} - invalid key", addr);
-                    return;
+    let Some(Ok(bytes)) = timeout(30_000, stream.recv()).await.ok().flatten() else {
+        return;
+    };
+    let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) else {
+        return;
+    };
+    let Some(rendezvous_message::Union::RequestRelay(request)) = msg_in.union else {
+        return;
+    };
+    let is_bot = request.token.starts_with(quic_relay::BOT_TOKEN_PREFIX);
+    if !authorize_request(&mut stream, &request, options, transport, addr, is_bot) {
+        return;
+    }
+    if is_bot && !options.upstream.quic_addr.is_empty() || !options.upstream.tcp_addr.is_empty() {
+        relay_upstream(stream, addr, options, limiter, bytes, is_bot).await;
+        return;
+    }
+    if !request.uuid.is_empty() {
+        relay_local(stream, addr, limiter, request.uuid).await;
+    }
+}
+
+fn authorize_request(
+    stream: &mut impl StreamTrait,
+    request: &RequestRelay,
+    options: &RelayOptions,
+    transport: Transport,
+    addr: SocketAddr,
+    is_bot: bool,
+) -> bool {
+    if !options.key.is_empty() && request.licence_key != options.key {
+        log::warn!("Relay authentication failed from {} - invalid key", addr);
+        return false;
+    }
+    if is_bot && !quic_relay::verify_bot_token(&request.token, &request.uuid, &options.token_secret)
+    {
+        log::warn!(
+            "Relay authentication failed from {} - invalid bot token",
+            addr
+        );
+        stream.close_auth_failed();
+        return false;
+    }
+    if transport == Transport::Quic && !is_bot {
+        log::warn!("Relay QUIC request from {} is missing bot token", addr);
+        stream.close_auth_failed();
+        return false;
+    }
+    true
+}
+
+async fn relay_upstream(
+    mut stream: impl StreamTrait,
+    addr: SocketAddr,
+    options: &RelayOptions,
+    limiter: Limiter,
+    bytes: BytesMut,
+    is_bot: bool,
+) {
+    let Some((mut peer, transport, fallback)) =
+        open_upstream(options, is_bot, &mut stream, addr).await
+    else {
+        return;
+    };
+    log::info!(
+        "Relay upstream transport={} fallback={} for {}",
+        transport,
+        fallback,
+        addr
+    );
+    if let Err(err) = peer.send_raw(bytes.freeze()).await {
+        log::warn!("failed to send relay request upstream: {}", err);
+        return;
+    }
+    relay_pair(stream, &mut peer, addr, limiter).await;
+}
+
+async fn open_upstream(
+    options: &RelayOptions,
+    is_bot: bool,
+    stream: &mut impl StreamTrait,
+    addr: SocketAddr,
+) -> Option<(Box<dyn StreamTrait>, &'static str, &'static str)> {
+    let mut fallback = "none";
+    if is_bot && !options.upstream.quic_addr.is_empty() {
+        let Some(pin) = options.upstream.pin else {
+            log::warn!("relay upstream pin is missing");
+            stream.close_auth_failed();
+            return None;
+        };
+        match quic_relay::connect_upstream(
+            &options.upstream.quic_addr,
+            &options.upstream.sni,
+            pin,
+            options.upstream.ipv6,
+        )
+        .await
+        {
+            Ok(upstream) => return Some((Box::new(upstream), "quic", fallback)),
+            Err(err) if err.is_auth() => {
+                log::warn!("relay upstream authentication failed: {}", err);
+                stream.close_auth_failed();
+                return None;
+            }
+            Err(err) => {
+                log::warn!("relay upstream quic unavailable: {}", err);
+                if options.upstream.ipv6 == IpPreference::Only {
+                    return None;
                 }
-                if !upstream.is_empty() {
-                    let mut upstream = match FramedStream::new(upstream, None, 5_000).await {
-                        Ok(upstream) => upstream,
-                        Err(err) => {
-                            log::warn!("failed to connect relay upstream {}: {}", upstream, err);
-                            return;
-                        }
-                    };
-                    if let Err(err) = upstream.send_raw(bytes.clone().into()).await {
-                        log::warn!("failed to send relay request upstream: {}", err);
-                        return;
-                    }
-                    let mut peer: Box<dyn StreamTrait> = Box::new(upstream);
-                    let id = format!("{}:{}", addr.ip(), addr.port());
-                    USAGE.write().await.insert(id.clone(), Default::default());
-                    stream.set_raw();
-                    peer.set_raw();
-                    if let Err(err) = relay(addr, &mut stream, &mut peer, limiter, id.clone()).await
-                    {
-                        log::info!("Relay upstream of {} closed: {}", addr, err);
-                    }
-                    USAGE.write().await.remove(&id);
-                    return;
-                }
-                if !rf.uuid.is_empty() {
-                    let mut peer = PEERS.lock().await.remove(&rf.uuid);
-                    if let Some(peer) = peer.as_mut() {
-                        log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
-                        let id = format!("{}:{}", addr.ip(), addr.port());
-                        USAGE.write().await.insert(id.clone(), Default::default());
-                        if !stream.is_ws() && !peer.is_ws() {
-                            peer.set_raw();
-                            stream.set_raw();
-                            log::info!("Both are raw");
-                        }
-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
-                        {
-                            log::info!("Relay of {} closed: {}", addr, err);
-                        } else {
-                            log::info!("Relay of {} closed", addr);
-                        }
-                        USAGE.write().await.remove(&id);
-                    } else {
-                        log::info!("New relay request {} from {}", rf.uuid, addr);
-                        PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
-                        sleep(30.).await;
-                        PEERS.lock().await.remove(&rf.uuid);
-                    }
-                }
+                fallback = "network";
             }
         }
     }
+    if options.upstream.tcp_addr.is_empty() {
+        log::warn!("no relay upstream available for {}", addr);
+        return None;
+    }
+    match FramedStream::new(&options.upstream.tcp_addr, None, 5_000).await {
+        Ok(upstream) => Some((Box::new(upstream), "tcp", fallback)),
+        Err(err) => {
+            log::warn!(
+                "failed to connect relay upstream {}: {}",
+                options.upstream.tcp_addr,
+                err
+            );
+            None
+        }
+    }
+}
+
+async fn relay_local(stream: impl StreamTrait, addr: SocketAddr, limiter: Limiter, uuid: String) {
+    let stream = stream;
+    let mut peer = PEERS.lock().await.remove(&uuid);
+    if let Some(peer) = peer.as_mut() {
+        log::info!("Relayrequest {} from {} got paired", uuid, addr);
+        relay_pair(stream, peer, addr, limiter).await;
+    } else {
+        log::info!("New relay request {} from {}", uuid, addr);
+        PEERS.lock().await.insert(uuid.clone(), Box::new(stream));
+        sleep(30.).await;
+        PEERS.lock().await.remove(&uuid);
+    }
+}
+
+async fn relay_pair(
+    mut stream: impl StreamTrait,
+    peer: &mut Box<dyn StreamTrait>,
+    addr: SocketAddr,
+    limiter: Limiter,
+) {
+    let id = format!("{}:{}", addr.ip(), addr.port());
+    USAGE.write().await.insert(id.clone(), Default::default());
+    if !stream.is_ws() && !peer.is_ws() {
+        peer.set_raw();
+        stream.set_raw();
+        log::info!("Both are raw");
+    }
+    if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await {
+        log::info!("Relay of {} closed: {}", addr, err);
+    } else {
+        log::info!("Relay of {} closed", addr);
+    }
+    USAGE.write().await.remove(&id);
 }
 
 async fn relay(
@@ -662,11 +939,12 @@ fn get_server_sk(key: &str) -> ResultType<String> {
 }
 
 #[async_trait]
-trait StreamTrait: Send + Sync + 'static {
+pub(crate) trait StreamTrait: Send + Sync + 'static {
     async fn recv(&mut self) -> Option<Result<BytesMut, Error>>;
     async fn send_raw(&mut self, bytes: Bytes) -> ResultType<()>;
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
+    fn close_auth_failed(&mut self) {}
 }
 
 #[async_trait]

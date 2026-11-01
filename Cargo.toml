@@ -1,6 +1,6 @@
 [package]
 name = "hbbs"
-version = "1.1.20"
+version = "1.1.21"
 authors = ["rustdesk <info@rustdesk.com>"]
 edition = "2021"
 build = "build.rs"
@@ -34,6 +34,12 @@ sqlx = { version = "0.6", features = [ "runtime-tokio-rustls", "sqlite", "macros
 deadpool = "0.8"
 async-trait = "0.1"
 async-speed-limit = { git = "https://github.com/open-trade/async-speed-limit" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring", "log"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
+socket2 = { version = "0.5", features = ["all"] }
 uuid = { version = "1.0", features = ["v4"] }
 bcrypt = "0.13"
 chrono = "0.4"
