@@ -18,6 +18,7 @@ use hbb_common::{
     ResultType,
 };
 use quinn::{
+    congestion::BbrConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     ClientConfig, Connection, ConnectionError, Endpoint, EndpointConfig, RecvStream, SendStream,
     ServerConfig, TokioRuntime, TransportConfig,
@@ -85,6 +86,7 @@ pub(crate) async fn start_listener(
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
     transport.max_concurrent_bidi_streams(1u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
     server_config.transport_config(Arc::new(transport));
@@ -268,6 +270,7 @@ fn client_config(
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
+    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
     let mut config = ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(transport));
     Ok(config)

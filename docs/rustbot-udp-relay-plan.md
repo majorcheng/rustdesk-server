@@ -253,6 +253,9 @@ pin = "sha256:" + standard_base64(SHA-256(DER end-entity certificate))
   - pin 模式忽略 hostname，但仍需要合法 `server_name`；
   - IPv6/IPv4 字面量时使用 `relay_quic_sni`/`RELAY_UPSTREAM_QUIC_SNI` 指定的名字；未配置时用配置的主机名；两者都没有则配置错误。
 - ALPN 在 `rustls::ClientConfig.alpn_protocols` 设置；服务端 `ServerConfig` 同样设置。
+- 拥塞控制：两端都用 quinn 内置 BBR（`TransportConfig::congestion_controller_factory` +
+  `quinn::congestion::BbrConfig`），默认是 CUBIC。拥塞控制是发送端行为，所以 hbbr listener、
+  hbbr upstream client、RustBot client 三处都要设置才覆盖双向流量。
 
 ### 4.6 回落策略
 
