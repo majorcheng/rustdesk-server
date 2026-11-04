@@ -750,6 +750,8 @@ mod integration_tests {
                 sni: String::new(),
                 ipv6: IpPreference::Prefer,
             },
+            services: Default::default(),
+            service_timeout: Duration::from_millis(3_000),
         });
         let port = free_udp_port();
         let limiter = Limiter::new(f64::INFINITY);
@@ -876,6 +878,8 @@ mod ipv6_tests {
                 sni: String::new(),
                 ipv6: IpPreference::Prefer,
             },
+            services: Default::default(),
+            service_timeout: Duration::from_millis(3_000),
         });
         let listener = tokio::spawn(start_listener(
             Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),

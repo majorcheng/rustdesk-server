@@ -158,12 +158,28 @@ ports.
 | `RELAY-UPSTREAM-QUIC-FALLBACK-ON-AUTH-ERROR` 🅴 | — | `N` | v1 requires `N`: certificate/pin/ALPN/token failures do not fall back to TCP; only network failures do. |
 | `RELAY-BOT-TOKEN-SECRET` 🅴 | — | *(empty)* | HMAC secret for RustBot data-plane relay tokens. Required when the QUIC listener is enabled or `RELAY-UPSTREAM-QUIC` is configured. |
 | `RELAY-QUIC-MAX-CONN` / `RELAY-QUIC-MAX-CONN-PER-IP` 🅴 | — | `10000` / `64` | Global and per-IP QUIC connection limits. |
+| `RELAY-SERVICES` 🅴 | — | *(empty)* | Master-only allowlist of service IDs and their local endpoints: `rustnet.management=unix:/run/rustbot-api/management.sock` or `name=tcp:127.0.0.1:21202`. Comma-separated. A relay with an upstream must not set it, and it requires `RELAY-BOT-TOKEN-SECRET`. |
+| `RELAY-SERVICE-TIMEOUT-MS` 🅴 | — | `3000` | Timeout for connecting the configured local endpoint. Allowed range `100`–`30000`. |
 
 > QUIC v1 is pin-only. The relay certificate should be self-signed (the generated default
 > is); a CA-signed certificate is reserved for a future `ca` mode. A pin mismatch, expired
 > certificate, TLS signature failure, or ALPN mismatch fails the current session and does
 > **not** fall back to TCP; only network unavailability falls back. `RELAY-ROLE=standalone`
 > is the default, so existing hbbr deployments do not need to configure it.
+
+### Service streams
+
+A client can open a named service instead of pairing with another peer. The first packet uses
+its own marker ahead of the existing length frame, so peer traffic and `RendezvousMessage`
+are unchanged. An edge relay forwards the request to its configured upstream; a relay with
+`RELAY-SERVICES` validates the admission proof, connects the declared local endpoint, replies
+with a result code, and then forwards bytes. Clients cannot supply a target address, and
+service IDs that are not configured return `service_not_found`.
+
+The admission proof is an HMAC over the protocol version, service ID, and request ID, derived
+from `RELAY-BOT-TOKEN-SECRET` with a service-specific domain. The relay licence key is not
+used on this path. This proves cluster membership only; device identity is verified by the
+service itself after the stream is established.
 
 ### Relay bandwidth / QoS
 

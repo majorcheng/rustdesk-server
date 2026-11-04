@@ -13,7 +13,7 @@ use hbb_common::{
     tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, UnixStream},
         sync::{Mutex, RwLock},
         time::{interval, Duration},
     },
@@ -33,6 +33,7 @@ use std::{
 };
 
 use crate::quic_relay::{self, IpPreference};
+use crate::service::{self, ServiceCode, ServiceRequest, ServiceTarget};
 
 type Usage = (usize, usize, usize, usize);
 
@@ -71,6 +72,8 @@ pub(crate) struct RelayOptions {
     pub(crate) key: String,
     pub(crate) token_secret: String,
     pub(crate) upstream: UpstreamConfig,
+    pub(crate) services: HashMap<String, ServiceTarget>,
+    pub(crate) service_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -143,6 +146,24 @@ fn build_runtime_options(
     if fallback_on_auth_error {
         bail!("RELAY_UPSTREAM_QUIC_FALLBACK_ON_AUTH_ERROR is not supported in v1");
     }
+    let services = service::parse_targets(&crate::common::get_arg("RELAY_SERVICES"))?;
+    let service_timeout =
+        parse_service_timeout(&crate::common::get_arg("RELAY_SERVICE_TIMEOUT_MS"))?;
+    let has_upstream = !upstream_tcp.is_empty() || !upstream_quic.is_empty();
+    if !services.is_empty() && has_upstream {
+        bail!("RELAY_SERVICES cannot be combined with a relay upstream");
+    }
+    if !services.is_empty() && token_secret.is_empty() {
+        bail!("RELAY_BOT_TOKEN_SECRET is required when RELAY_SERVICES is configured");
+    }
+    for (name, target) in &services {
+        match target {
+            ServiceTarget::Unix(path) => {
+                log::info!("Service {}: unix:{}", name, path.display());
+            }
+            ServiceTarget::Tcp(addr) => log::info!("Service {}: tcp:{}", name, addr),
+        }
+    }
     validate_role(&upstream_tcp, &upstream_quic)?;
     let sni = crate::common::get_arg("RELAY_UPSTREAM_QUIC_SNI");
     let ipv6 = IpPreference::from_arg(&crate::common::get_arg("RELAY_UPSTREAM_IPV6"));
@@ -164,6 +185,8 @@ fn build_runtime_options(
             sni,
             ipv6,
         },
+        services,
+        service_timeout,
     });
     let config = QuicListenerConfig {
         enabled: quic_enabled,
@@ -177,6 +200,20 @@ fn build_runtime_options(
         key: path_arg("RELAY_QUIC_KEY"),
     };
     Ok((options, config))
+}
+
+fn parse_service_timeout(value: &str) -> ResultType<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(Duration::from_millis(3_000));
+    }
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("invalid RELAY_SERVICE_TIMEOUT_MS: {value}"))?;
+    if !(100..=30_000).contains(&millis) {
+        bail!("RELAY_SERVICE_TIMEOUT_MS must be within 100..=30000");
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 fn validate_role(upstream_tcp: &str, upstream_quic: &str) -> ResultType<()> {
@@ -651,6 +688,10 @@ pub(crate) async fn make_pair_(
     let Some(Ok(bytes)) = timeout(30_000, stream.recv()).await.ok().flatten() else {
         return;
     };
+    if service::is_service_frame(&bytes) {
+        handle_service_frame(stream, addr, options, limiter, bytes, transport).await;
+        return;
+    }
     let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) else {
         return;
     };
@@ -713,11 +754,11 @@ async fn relay_upstream(
     options: &RelayOptions,
     limiter: Limiter,
     bytes: BytesMut,
-    is_bot: bool,
+    quic_ok: bool,
     inbound: Transport,
 ) {
     let Some((mut peer, transport, fallback)) =
-        open_upstream(options, is_bot, &mut stream, addr).await
+        open_upstream(options, quic_ok, &mut stream, addr).await
     else {
         return;
     };
@@ -737,12 +778,12 @@ async fn relay_upstream(
 
 async fn open_upstream(
     options: &RelayOptions,
-    is_bot: bool,
+    quic_ok: bool,
     stream: &mut impl StreamTrait,
     addr: SocketAddr,
 ) -> Option<(Box<dyn StreamTrait>, &'static str, &'static str)> {
     let mut fallback = "none";
-    if is_bot && !options.upstream.quic_addr.is_empty() {
+    if quic_ok && !options.upstream.quic_addr.is_empty() {
         let Some(pin) = options.upstream.pin else {
             log::warn!("relay upstream pin is missing");
             stream.close_auth_failed();
@@ -785,6 +826,139 @@ async fn open_upstream(
             );
             None
         }
+    }
+}
+
+fn is_edge(options: &RelayOptions) -> bool {
+    !options.upstream.tcp_addr.is_empty() || !options.upstream.quic_addr.is_empty()
+}
+
+/// 服务首包：edge 转发到 upstream，master 接到本地服务后进入字节转发。
+async fn handle_service_frame(
+    mut stream: impl StreamTrait,
+    addr: SocketAddr,
+    options: &RelayOptions,
+    limiter: Limiter,
+    bytes: BytesMut,
+    inbound: Transport,
+) {
+    let Some(request) = ServiceRequest::parse(&bytes) else {
+        log::warn!("Invalid service frame from {}", addr);
+        return;
+    };
+    if request.version > service::VERSION {
+        log::warn!(
+            "Service {} version {} is newer than supported {}",
+            request.service_id,
+            request.version,
+            service::VERSION
+        );
+        send_service_result(&mut stream, &request, ServiceCode::UnsupportedVersion).await;
+        return;
+    }
+    if !service::verify(&options.token_secret, &request) {
+        log::warn!(
+            "Service {} from {} failed admission",
+            request.service_id,
+            addr
+        );
+        send_service_result(&mut stream, &request, ServiceCode::Denied).await;
+        stream.close_auth_failed();
+        return;
+    }
+    if is_edge(options) {
+        let Some((mut peer, transport, fallback)) =
+            open_upstream(options, true, &mut stream, addr).await
+        else {
+            send_service_result(&mut stream, &request, ServiceCode::Unavailable).await;
+            return;
+        };
+        log::info!(
+            "Service {} transport={} inbound={} fallback={} for {}",
+            request.service_id,
+            transport,
+            transport_name(inbound),
+            fallback,
+            addr
+        );
+        if let Err(err) = peer.send_raw(bytes.freeze()).await {
+            log::warn!("Failed to forward service request upstream: {}", err);
+            return;
+        }
+        relay_pair(stream, &mut peer, addr, limiter).await;
+        return;
+    }
+    let Some(target) = options.services.get(&request.service_id) else {
+        log::info!(
+            "Service {} is not configured on this relay ({})",
+            request.service_id,
+            addr
+        );
+        send_service_result(&mut stream, &request, ServiceCode::NotFound).await;
+        return;
+    };
+    match connect_local_service(target, options.service_timeout).await {
+        Ok(mut peer) => {
+            log::info!("Service {} from {} is connected", request.service_id, addr);
+            send_service_result(&mut stream, &request, ServiceCode::Ok).await;
+            relay_pair(stream, &mut peer, addr, limiter).await;
+        }
+        Err(err) => {
+            log::warn!(
+                "Service {} local target is unavailable: {:#}",
+                request.service_id,
+                err
+            );
+            send_service_result(&mut stream, &request, ServiceCode::Unavailable).await;
+        }
+    }
+}
+
+async fn send_service_result(
+    stream: &mut impl StreamTrait,
+    request: &ServiceRequest,
+    code: ServiceCode,
+) {
+    let result = service::ServiceResult {
+        version: request.version,
+        request_id: request.request_id,
+        code,
+    };
+    if let Err(err) = stream.send_raw(result.encode()).await {
+        log::warn!(
+            "Failed to send service result {} to {}: {}",
+            code.label(),
+            request.service_id,
+            err
+        );
+    }
+}
+
+async fn connect_local_service(
+    target: &ServiceTarget,
+    connect_timeout: Duration,
+) -> ResultType<Box<dyn StreamTrait>> {
+    let millis = u64::try_from(connect_timeout.as_millis()).unwrap_or(u64::MAX);
+    match target {
+        ServiceTarget::Unix(path) => {
+            let stream = match timeout(millis, UnixStream::connect(path)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    return Err(anyhow::anyhow!(
+                        "connect {} failed: {}",
+                        path.display(),
+                        err
+                    ))
+                }
+                Err(_) => return Err(anyhow::anyhow!("connect {} timed out", path.display())),
+            };
+            // FramedStream 的 SocketAddr 只是元数据，Unix socket 没有地址，仅占位。
+            Ok(Box::new(FramedStream::from(
+                stream,
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            )))
+        }
+        ServiceTarget::Tcp(addr) => Ok(Box::new(FramedStream::new(addr, None, millis).await?)),
     }
 }
 
@@ -1023,4 +1197,286 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
     }
 
     fn set_raw(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+        let len = payload.len();
+        let head_len = if len <= 0x3f {
+            1
+        } else if len <= 0x3fff {
+            2
+        } else if len <= 0x3f_ffff {
+            3
+        } else {
+            4
+        };
+        let encoded = ((len as u32) << 2) | (head_len as u32 - 1);
+        stream.write_all(&encoded.to_le_bytes()[..head_len]).await?;
+        stream.write_all(payload).await
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head[..1]).await?;
+        let head_len = ((head[0] & 0x03) + 1) as usize;
+        if head_len > 1 {
+            stream.read_exact(&mut head[1..head_len]).await?;
+        }
+        let len = (u32::from_le_bytes(head) >> 2) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await?;
+        Ok(payload)
+    }
+
+    fn test_options(services: HashMap<String, ServiceTarget>) -> Arc<RelayOptions> {
+        Arc::new(RelayOptions {
+            key: String::new(),
+            token_secret: "secret".to_owned(),
+            upstream: UpstreamConfig {
+                quic_addr: String::new(),
+                tcp_addr: String::new(),
+                pin: None,
+                sni: String::new(),
+                ipv6: IpPreference::Off,
+            },
+            services,
+            service_timeout: Duration::from_millis(2_000),
+        })
+    }
+
+    async fn spawn_relay(
+        options: Arc<RelayOptions>,
+    ) -> ResultType<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let Ok((stream, peer)) = listener.accept().await else {
+                return;
+            };
+            make_pair_(
+                FramedStream::from(stream, peer),
+                peer,
+                &options,
+                <Limiter>::new(1e9),
+                Transport::Tcp,
+            )
+            .await;
+        });
+        Ok((addr, handle))
+    }
+
+    fn request(service_id: &str, secret: &str) -> ServiceRequest {
+        let request_id = [7u8; 16];
+        ServiceRequest {
+            version: service::VERSION,
+            service_id: service_id.to_owned(),
+            request_id,
+            proof: service::proof(secret, service::VERSION, service_id, &request_id),
+        }
+    }
+
+    async fn read_result(stream: &mut TcpStream) -> ResultType<ServiceCode> {
+        let payload = read_frame(stream).await?;
+        let result = service::ServiceResult::parse(&payload)
+            .ok_or_else(|| anyhow::anyhow!("invalid service result"))?;
+        Ok(result.code)
+    }
+
+    #[tokio::test]
+    async fn service_frame_reaches_local_target_and_keeps_bytes_transparent() -> ResultType<()> {
+        let target = TcpListener::bind("127.0.0.1:0").await?;
+        let target_addr = target.local_addr()?;
+        let target_task = tokio::spawn(async move {
+            let (mut socket, _) = target.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            socket.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            socket.write_all(b"pong").await.unwrap();
+            socket.shutdown().await.ok();
+        });
+
+        let mut services = HashMap::new();
+        services.insert(
+            "test.svc".to_owned(),
+            ServiceTarget::Tcp(target_addr.to_string()),
+        );
+        let (relay_addr, relay_task) = spawn_relay(test_options(services)).await?;
+
+        let mut agent = TcpStream::connect(relay_addr).await?;
+        write_frame(&mut agent, &request("test.svc", "secret").encode()).await?;
+        assert_eq!(read_result(&mut agent).await?, ServiceCode::Ok);
+
+        // OK 之后进入 raw 转发：内层字节原样通过，不再套一层长度帧。
+        agent.write_all(b"ping").await?;
+        let mut buf = [0u8; 4];
+        agent.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"pong");
+
+        target_task.await?;
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_proof_is_denied() -> ResultType<()> {
+        let (relay_addr, relay_task) = spawn_relay(test_options(HashMap::new())).await?;
+        let mut agent = TcpStream::connect(relay_addr).await?;
+        write_frame(&mut agent, &request("test.svc", "wrong").encode()).await?;
+        assert_eq!(read_result(&mut agent).await?, ServiceCode::Denied);
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_service_is_not_found() -> ResultType<()> {
+        let (relay_addr, relay_task) = spawn_relay(test_options(HashMap::new())).await?;
+        let mut agent = TcpStream::connect(relay_addr).await?;
+        write_frame(&mut agent, &request("test.svc", "secret").encode()).await?;
+        assert_eq!(read_result(&mut agent).await?, ServiceCode::NotFound);
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_local_target_is_reported() -> ResultType<()> {
+        // 绑定后立即释放端口，确保连接被拒绝。
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            listener.local_addr()?.port()
+        };
+        let mut services = HashMap::new();
+        services.insert(
+            "test.svc".to_owned(),
+            ServiceTarget::Tcp(format!("127.0.0.1:{port}")),
+        );
+        let (relay_addr, relay_task) = spawn_relay(test_options(services)).await?;
+        let mut agent = TcpStream::connect(relay_addr).await?;
+        write_frame(&mut agent, &request("test.svc", "secret").encode()).await?;
+        assert_eq!(read_result(&mut agent).await?, ServiceCode::Unavailable);
+        relay_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn newer_service_version_is_rejected() -> ResultType<()> {
+        let (relay_addr, relay_task) = spawn_relay(test_options(HashMap::new())).await?;
+        let mut agent = TcpStream::connect(relay_addr).await?;
+        let request_id = [1u8; 16];
+        let mut request = request("test.svc", "secret");
+        request.version = service::VERSION + 1;
+        request.proof = service::proof("secret", request.version, &request.service_id, &request_id);
+        write_frame(&mut agent, &request.encode()).await?;
+        assert_eq!(
+            read_result(&mut agent).await?,
+            ServiceCode::UnsupportedVersion
+        );
+        relay_task.abort();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+        let len = payload.len();
+        let encoded = ((len as u32) << 2) | 0;
+        stream.write_all(&encoded.to_le_bytes()[..1]).await?;
+        stream.write_all(payload).await
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head[..1]).await?;
+        let head_len = ((head[0] & 0x03) + 1) as usize;
+        if head_len > 1 {
+            stream.read_exact(&mut head[1..head_len]).await?;
+        }
+        let len = (u32::from_le_bytes(head) >> 2) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await?;
+        Ok(payload)
+    }
+
+    /// edge 不解析服务映射，只把服务首包与后续字节转发到 upstream。
+    #[tokio::test]
+    async fn edge_forwards_service_stream_to_upstream() -> ResultType<()> {
+        let upstream = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_addr = upstream.local_addr()?;
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, addr) = upstream.accept().await.unwrap();
+            let payload = read_frame(&mut stream).await.unwrap();
+            let request = service::ServiceRequest::parse(&payload).unwrap();
+            assert_eq!(request.service_id, "test.svc");
+            let result = service::ServiceResult {
+                version: request.version,
+                request_id: request.request_id,
+                code: ServiceCode::Ok,
+            };
+            write_frame(&mut stream, &result.encode()).await.unwrap();
+            // raw 回显
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.shutdown().await.ok();
+            addr
+        });
+
+        let edge = TcpListener::bind("127.0.0.1:0").await?;
+        let edge_addr = edge.local_addr()?;
+        let options = Arc::new(RelayOptions {
+            key: String::new(),
+            token_secret: "secret".to_owned(),
+            upstream: UpstreamConfig {
+                quic_addr: String::new(),
+                tcp_addr: upstream_addr.to_string(),
+                pin: None,
+                sni: String::new(),
+                ipv6: IpPreference::Off,
+            },
+            services: HashMap::new(),
+            service_timeout: Duration::from_millis(2_000),
+        });
+        let edge_options = options.clone();
+        let edge_task = tokio::spawn(async move {
+            let (stream, addr) = edge.accept().await.unwrap();
+            make_pair_(
+                FramedStream::from(stream, addr),
+                addr,
+                &edge_options,
+                <Limiter>::new(1e9),
+                Transport::Tcp,
+            )
+            .await;
+        });
+
+        let mut agent = TcpStream::connect(edge_addr).await?;
+        let request_id = [5u8; 16];
+        let request = service::ServiceRequest {
+            version: service::VERSION,
+            service_id: "test.svc".to_owned(),
+            request_id,
+            proof: service::proof("secret", service::VERSION, "test.svc", &request_id),
+        };
+        write_frame(&mut agent, &request.encode()).await?;
+        let payload = read_frame(&mut agent).await?;
+        let result = service::ServiceResult::parse(&payload)
+            .ok_or_else(|| anyhow::anyhow!("invalid result"))?;
+        assert_eq!(result.code, ServiceCode::Ok);
+
+        agent.write_all(b"ping").await?;
+        let mut buf = [0u8; 4];
+        agent.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"pong");
+
+        upstream_task.await?;
+        edge_task.abort();
+        Ok(())
+    }
 }

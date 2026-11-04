@@ -1,3 +1,19 @@
+rustdesk-server (1.1.23) UNRELEASED; urgency=medium
+
+  * Add a named service stream alongside peer relay: a dedicated first
+    packet carries a version, service ID, request ID and HMAC admission
+    proof, and is recognised before RendezvousMessage is parsed.
+  * Forward service streams from an edge relay to its configured upstream,
+    and let a master relay map a declared service ID to a local Unix socket
+    or loopback TCP endpoint, answering with an explicit result code.
+  * Derive the service admission proof from RELAY-BOT-TOKEN-SECRET with its
+    own domain string; the relay licence key is not used on this path and
+    clients cannot supply a target address.
+  * Add RELAY-SERVICES and RELAY-SERVICE-TIMEOUT-MS, refusing to start when
+    a service map and a relay upstream are configured together.
+
+ -- majorcheng <major@thu.cn>  Sat, 05 Dec 2026 12:00:00 +0800
+
 rustdesk-server (1.1.22) UNRELEASED; urgency=medium
 
   * Add a loopback-only read-only federation directory for local management
