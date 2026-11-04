@@ -51,6 +51,8 @@ in the inherited process environment.
 | `FEDERATION-BIND` 🅴 | — | *(empty)* | Local `host:port` on which the node accepts federation links. Set this on the public master, for example `0.0.0.0:21200`. |
 | `FEDERATION-KEY` 🅴 | — | *(empty)* | Shared secret required for hbbs node links. Federation refuses to start when it is enabled without this value. |
 | `FEDERATION-RELAY` 🅴 | — | first `RELAY-SERVERS` entry | Relay address that clients in this node's local network can reach. An edge node advertises this to the master. |
+| `FEDERATION-DIRECTORY-BIND` 🅴 | — | *(empty)* | Loopback-only read-only peer directory, for example `127.0.0.1:21201`. Empty disables it. Requires `FEDERATION-DIRECTORY-TOKEN`. |
+| `FEDERATION-DIRECTORY-TOKEN` 🅴 | — | *(empty)* | Bearer token for the directory. 32–256 non-whitespace ASCII bytes. Never logged. Required when the directory bind is set. |
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
 | `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
@@ -96,6 +98,38 @@ reach the other site's private address.
 Use the same non-empty `KEY` for the hbbs/hbbr instances participating in a
 cluster when Relay authentication is enabled. `FEDERATION-KEY` authenticates
 node links and is independent from the client/Relay key.
+
+Cross-node `PunchHoleResponse.pk` and `RelayResponse.pk` are signed by the
+**target** hbbs and verified by the source client. Every hbbs that can serve a
+cross-node peer must therefore use the same signing key pair. A public-key-only
+`KEY` value is not enough for that node: the source hbbs must hold the matching
+secret key. Verify one new edge with a cross-node RelayResponse before rolling
+out the rest.
+
+When an edge hbbs delivers a federated `RequestRelay` to a local peer, it
+rewrites `relay_server` to the edge's local relay. Set `RELAY-SERVERS` and an
+explicit `FEDERATION_RELAY` to the same normalized value, and make the RustBot
+device's `hbbr` configuration match it. Do not rely on two DNS aliases: the
+RustBot Agent compares the normalized strings.
+
+### Read-only federation directory
+
+The optional directory is a loopback-only HTTP service in `hbbs`. It is
+intended for the local management API; do not expose it through a public reverse
+proxy. Requests require `Authorization: Bearer <FEDERATION-DIRECTORY-TOKEN>`.
+
+- `GET /internal/v1/peer-snapshot?limit=4096&cursor=<n>&snapshot=<id>`:
+  paginated local and federated peers. The first response creates a snapshot;
+  later pages pass the returned `snapshot_id`. An expired or unknown snapshot
+  returns `410`, and a stale cursor returns `400`.
+- `GET /internal/v1/peers/<id>`: the current confirmed identity and owner of
+  one peer, or `404` when the node has no current evidence.
+
+The directory reads the runtime peer map and the local peer table. Federated
+peers are not copied into the master's `peer` table. The management API uses
+the directory for inventory, metadata signature verification, and self-update
+identity. A missing federated lease returns an unconfirmed result; it must not
+fall back to an old local key.
 
 The federation listener is a node-to-node service and should be protected by
 the firewall. It is not a replacement for the client-facing hbbs or hbbr

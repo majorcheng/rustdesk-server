@@ -116,9 +116,18 @@ pub(crate) struct RemoteRoute {
     pub(crate) expires_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NodeState {
+    pub(crate) node_id: String,
+    pub(crate) source_ip: SocketAddr,
+    pub(crate) last_seen: Instant,
+}
+
 struct Link {
     tx: mpsc::UnboundedSender<Message>,
     id: u64,
+    source_ip: SocketAddr,
+    last_seen: Instant,
 }
 
 #[derive(Clone)]
@@ -229,6 +238,19 @@ impl Federation {
         self.node_id.as_str()
     }
 
+    pub(crate) async fn node_states(&self) -> Vec<NodeState> {
+        self.links
+            .read()
+            .await
+            .iter()
+            .map(|(node_id, link)| NodeState {
+                node_id: node_id.clone(),
+                source_ip: link.source_ip,
+                last_seen: link.last_seen,
+            })
+            .collect()
+    }
+
     pub(crate) async fn relay_for(&self, node_id: &str) -> Option<String> {
         self.relays.read().await.get(node_id).cloned()
     }
@@ -326,7 +348,7 @@ impl Federation {
                     stream.set_nodelay(true).ok();
                     let cloned = self.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = cloned.run_server_connection(stream).await {
+                        if let Err(err) = cloned.run_server_connection(stream, addr).await {
                             log::warn!("federation connection from {} failed: {}", addr, err);
                         }
                     });
@@ -356,7 +378,7 @@ impl Federation {
         }
     }
 
-    async fn run_server_connection(&self, stream: TcpStream) -> ResultType<()> {
+    async fn run_server_connection(&self, stream: TcpStream, source_ip: SocketAddr) -> ResultType<()> {
         let framed = new_framed(stream);
         let (mut sink, mut source) = framed.split();
         let nonce = uuid::Uuid::new_v4().to_string();
@@ -392,10 +414,12 @@ impl Federation {
             },
         )
         .await?;
-        self.run_link(node_id, relay_server, sink, source).await
+        self.run_link(node_id, relay_server, source_ip, sink, source)
+            .await
     }
 
     async fn run_client_connection(&self, stream: TcpStream) -> ResultType<()> {
+        let source_ip = stream.peer_addr()?;
         let framed = new_framed(stream);
         let (mut sink, mut source) = framed.split();
         let first = hbb_common::timeout(CONNECT_TIMEOUT_MS, source.next())
@@ -428,13 +452,15 @@ impl Federation {
                 ))
             }
         };
-        self.run_link(node_id, relay_server, sink, source).await
+        self.run_link(node_id, relay_server, source_ip, sink, source)
+            .await
     }
 
     async fn run_link<S, R>(
         &self,
         node_id: String,
         relay_server: String,
+        source_ip: SocketAddr,
         mut sink: S,
         mut source: R,
     ) -> ResultType<()>
@@ -450,6 +476,8 @@ impl Federation {
             Link {
                 tx: tx.clone(),
                 id: link_id,
+                source_ip,
+                last_seen: Instant::now(),
             },
         );
         self.relays
@@ -485,6 +513,9 @@ impl Federation {
 
         while let Some(bytes) = source.next().await {
             let bytes = bytes?;
+            if let Some(link) = self.links.write().await.get_mut(&node_id) {
+                link.last_seen = Instant::now();
+            }
             match decode_wire(&bytes, &self.crypto_key)? {
                 Message::Ping => {
                     tx.send(Message::Pong).ok();

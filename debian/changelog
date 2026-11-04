@@ -1,3 +1,17 @@
+rustdesk-server (1.1.22) UNRELEASED; urgency=medium
+
+  * Add a loopback-only read-only federation directory for local management
+    APIs, with bearer authentication, paged peer snapshots and single-peer
+    identity lookups.
+  * Rewrite a federated RequestRelay to the target edge's local relay and
+    refuse the request when no local relay is configured.
+  * Stop publishing expired local peers across federation links so a
+    reconnect cannot briefly mark offline peers online.
+  * Record federation link source addresses and last control observation
+    times for site health.
+
+ -- majorcheng <major@thu.cn>  Wed, 04 Nov 2026 12:00:00 +0800
+
 rustdesk-server (1.1.21) UNRELEASED; urgency=medium
 
   * Add an optional QUIC/UDP relay transport for RustBot peers, reusing the

@@ -80,6 +80,17 @@ impl Peer {
 
 pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct DirectoryPeer {
+    pub(crate) id: String,
+    pub(crate) uuid: Vec<u8>,
+    pub(crate) pk: Vec<u8>,
+    pub(crate) owner: String,
+    pub(crate) source_ip: String,
+    pub(crate) online: bool,
+    pub(crate) lease_age_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
@@ -274,7 +285,7 @@ impl PeerMap {
     pub(crate) async fn snapshot(&self, id: &str) -> Option<PeerLease> {
         let peer = self.map.read().await.get(id).cloned()?;
         let peer = peer.read().await;
-        if peer.owner != self.local_node || peer.pk.is_empty() {
+        if peer.owner != self.local_node || peer.pk.is_empty() || !peer.is_reachable() {
             return None;
         }
         Some(PeerLease {
@@ -295,12 +306,104 @@ impl PeerMap {
         }
         snapshots
     }
+
+    pub(crate) async fn directory_snapshot(&self) -> ResultType<Vec<DirectoryPeer>> {
+        let db_peers = self.db.list_peers().await?;
+        let entries: Vec<(String, LockPeer)> = self
+            .map
+            .read()
+            .await
+            .iter()
+            .map(|(id, peer)| (id.clone(), peer.clone()))
+            .collect();
+        let mut memory = HashMap::new();
+        for (id, peer) in entries {
+            let peer = peer.read().await;
+            memory.insert(
+                id.clone(),
+                directory_peer_from_peer(&id, &peer, self.local_node.as_str()),
+            );
+        }
+        let mut peers = Vec::with_capacity(db_peers.len().max(memory.len()));
+        for db_peer in db_peers {
+            if let Some(peer) = memory.remove(&db_peer.id) {
+                peers.push(peer);
+            } else {
+                peers.push(directory_peer_from_db(db_peer, self.local_node.as_str()));
+            }
+        }
+        peers.extend(memory.into_values());
+        peers.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(peers)
+    }
+
+    pub(crate) async fn directory_peer(&self, id: &str) -> ResultType<Option<DirectoryPeer>> {
+        if let Some(peer) = self.get_in_memory(id).await {
+            let peer = peer.read().await;
+            return Ok(Some(directory_peer_from_peer(
+                id,
+                &peer,
+                self.local_node.as_str(),
+            )));
+        }
+        let Some(db_peer) = self.db.get_peer(id).await? else {
+            return Ok(None);
+        };
+        if let Some(peer) = self.get_in_memory(id).await {
+            let peer = peer.read().await;
+            return Ok(Some(directory_peer_from_peer(
+                id,
+                &peer,
+                self.local_node.as_str(),
+            )));
+        }
+        Ok(Some(directory_peer_from_db(
+            db_peer,
+            self.local_node.as_str(),
+        )))
+    }
+}
+
+fn directory_peer_from_peer(id: &str, peer: &Peer, local_node: &str) -> DirectoryPeer {
+    let owner = if peer.owner.is_empty() {
+        local_node.to_owned()
+    } else {
+        peer.owner.clone()
+    };
+    let online = if owner == local_node {
+        peer.is_reachable()
+    } else {
+        (peer.last_reg_time.elapsed().as_millis() as i64) < PEER_REG_TIMEOUT_MS
+    };
+    DirectoryPeer {
+        id: id.to_owned(),
+        uuid: peer.uuid.to_vec(),
+        pk: peer.pk.to_vec(),
+        owner,
+        source_ip: peer.info.ip.clone(),
+        online,
+        lease_age_ms: Some(peer.last_reg_time.elapsed().as_millis() as u64),
+    }
+}
+
+fn directory_peer_from_db(peer: database::Peer, local_node: &str) -> DirectoryPeer {
+    let info = serde_json::from_str::<PeerInfo>(&peer.info).unwrap_or_default();
+    DirectoryPeer {
+        id: peer.id,
+        uuid: peer.uuid,
+        pk: peer.pk,
+        owner: local_node.to_owned(),
+        source_ip: info.ip,
+        online: false,
+        lease_age_ms: None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use hbb_common::tokio;
+    use std::time::Duration;
 
     async fn test_peer_map() -> (PeerMap, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
@@ -375,5 +478,75 @@ mod tests {
         assert_eq!(peer.pk.as_ref(), [1].as_slice());
         assert_eq!(peer.info.ip, "222.131.66.42");
         assert!(peer_map.remote_owner(id).await.is_none());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn expired_local_peer_is_not_published() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "rb-expired";
+        let peer = Arc::new(RwLock::new(Peer {
+            socket_addr: "127.0.0.1:21116".parse().unwrap(),
+            last_reg_time: Instant::now() - Duration::from_secs(60),
+            uuid: vec![1].into(),
+            pk: vec![1].into(),
+            info: PeerInfo {
+                ip: "127.0.0.1".to_owned(),
+            },
+            owner: "B".to_owned(),
+            ..Default::default()
+        }));
+        peer_map.map.write().await.insert(id.to_owned(), peer);
+
+        assert!(peer_map.snapshots().await.is_empty());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn directory_snapshot_prefers_remote_lease_over_local_db() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "rb-remote";
+        peer_map
+            .db
+            .insert_peer(id, &[1], &[1], r#"{"ip":"10.0.0.1"}"#)
+            .await
+            .unwrap();
+        peer_map.upsert_remote("A".to_owned(), remote_lease(id)).await;
+
+        let peers = peer_map.directory_snapshot().await.unwrap();
+        let peer = peers.iter().find(|peer| peer.id == id).unwrap();
+        assert_eq!(peer.owner, "A");
+        assert_eq!(peer.uuid, vec![2]);
+        assert_eq!(peer.pk, vec![3]);
+        assert_eq!(peer.source_ip, "36.112.108.165");
+        assert!(peer.online);
+
+        let peer = peer_map.directory_peer(id).await.unwrap().unwrap();
+        assert_eq!(peer.owner, "A");
+        assert_eq!(peer.pk, vec![3]);
+    }
+
+    #[hbb_common::tokio::test]
+    async fn directory_snapshot_includes_local_db_peer_as_offline() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "rb-local";
+        peer_map
+            .db
+            .insert_peer(id, &[1], &[1], r#"{"ip":"10.0.0.1"}"#)
+            .await
+            .unwrap();
+
+        let peers = peer_map.directory_snapshot().await.unwrap();
+        let peer = peers.iter().find(|peer| peer.id == id).unwrap();
+        assert_eq!(peer.owner, "B");
+        assert_eq!(peer.uuid, vec![1]);
+        assert_eq!(peer.pk, vec![1]);
+        assert_eq!(peer.source_ip, "10.0.0.1");
+        assert!(!peer.online);
+        assert!(peer.lease_age_ms.is_none());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn directory_peer_returns_none_for_unknown_id() {
+        let (peer_map, _directory) = test_peer_map().await;
+        assert!(peer_map.directory_peer("rb-unknown").await.unwrap().is_none());
     }
 }

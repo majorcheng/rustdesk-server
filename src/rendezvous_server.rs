@@ -205,6 +205,7 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
+        crate::federation_directory::start(rs.pm.clone(), rs.federation.clone()).await?;
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
@@ -1176,7 +1177,7 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
         let source_addr = message.source_addr.parse::<SocketAddr>()?;
-        let msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
+        let mut msg = RendezvousMessage::parse_from_bytes(&message.payload)?;
         let peer = self.pm.get_in_memory(&message.target_id).await;
         let Some(peer) = peer else {
             return self
@@ -1191,6 +1192,14 @@ impl RendezvousServer {
             return self
                 .forward_failure(message, &msg, punch_hole_response::Failure::OFFLINE)
                 .await;
+        }
+        let local_relay = self.local_relay_server();
+        if !rewrite_federated_request_relay(&mut msg, &local_relay) {
+            let mut response = RendezvousMessage::new();
+            let mut relay_response = RelayResponse::new();
+            relay_response.refuse_reason = "local relay not configured".to_owned();
+            response.set_relay_response(relay_response);
+            return self.forward_response(message, response).await;
         }
         self.federation
             .remember_route(RemoteRoute {
@@ -1922,6 +1931,17 @@ fn relay_response_source_addr(response: &RelayResponse) -> SocketAddr {
     AddrMangle::decode(&response.socket_addr)
 }
 
+fn rewrite_federated_request_relay(msg: &mut RendezvousMessage, local_relay: &str) -> bool {
+    let Some(rendezvous_message::Union::RequestRelay(request)) = msg.union.as_mut() else {
+        return true;
+    };
+    if local_relay.is_empty() {
+        return false;
+    }
+    request.relay_server = local_relay.to_owned();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,6 +1951,33 @@ mod tests {
         let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
+    }
+
+    #[test]
+    fn federated_request_relay_uses_target_local_relay() {
+        let mut msg = RendezvousMessage::new();
+        let mut request = RequestRelay::new();
+        request.relay_server = "relay-a.example:21117".to_owned();
+        msg.set_request_relay(request);
+        assert!(rewrite_federated_request_relay(
+            &mut msg,
+            "relay-b.example:21117"
+        ));
+        match msg.union {
+            Some(rendezvous_message::Union::RequestRelay(request)) => {
+                assert_eq!(request.relay_server, "relay-b.example:21117");
+            }
+            _ => panic!("expected RequestRelay"),
+        }
+    }
+
+    #[test]
+    fn federated_request_relay_refused_without_local_relay() {
+        let mut msg = RendezvousMessage::new();
+        let mut request = RequestRelay::new();
+        request.relay_server = "relay-a.example:21117".to_owned();
+        msg.set_request_relay(request);
+        assert!(!rewrite_federated_request_relay(&mut msg, ""));
     }
 
     #[test]

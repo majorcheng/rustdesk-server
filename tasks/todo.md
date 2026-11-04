@@ -1,3 +1,32 @@
+# 准备 1.1.22 Release
+
+- [x] 同步 Cargo、Cargo.lock、debian/changelog 和 Windows 安装器到 1.1.22。
+- [x] 汇总联邦只读目录、跨节点 Relay 地址改写、过期租约修复和文档。
+- [x] 运行锁定检查与聚焦测试；不做提交、打 tag 或触发发布，等待手动发布。
+
+影响范围：`Cargo.toml`、`Cargo.lock`、`debian/changelog`、`ui/setup.nsi`、本记录。
+
+# 联邦只读目录与跨节点 Relay 修复
+
+目标：让 A 的管理 API 能读取本机 hbbs 的本地/联邦 peer 目录，并让 RustBot 跨节点 Relay
+控制请求携带目标 edge 的本地 relay 地址。
+
+- [x] hbbs 新增 loopback-only 只读目录：peer 快照分页、单 peer 身份查询、Bearer token。
+- [x] 目标 edge hbbs 在 `handle_federated_to_peer` 中把 `RequestRelay.relay_server`
+  改写为本地 relay；空配置返回 `RelayResponse.refuse_reason`。
+- [x] `PeerMap::snapshot` 只发布仍可用的本地 peer；修复联邦重连补发过期租约后短暂复活的问题。
+- [x] 目录快照包含 site、owner、online、source_ip、site 源地址和最后控制观察时间。
+- [x] 补 peer 目录/远端优先/过期租约/relay 改写聚焦测试。
+- [x] 更新 `docs/environment-variables.md` 的联邦、共享签名密钥和目录说明。
+
+影响范围：`src/federation.rs`、`src/peer.rs`、`src/database.rs`、
+`src/federation_directory.rs`、`src/rendezvous_server.rs`、`src/lib.rs`、
+`docs/environment-variables.md`、本记录。
+
+验证记录：`cargo check --lib` 通过；`cargo test --lib peer::tests` 通过（6 passed）；
+`cargo test --lib rendezvous_server::tests` 通过（8 passed）。本机没有 Linux A/B 环境，
+未跑真实三跳 RustNet E2E、真实目录 HTTP 和跨站点密钥验签；未部署、未重启服务。
+
 # QUIC relay 传输
 
 目标：RustBot 的 `RustBot(B) → relay(B) → relay(A) → RustBot(A)` 全链路可以走 QUIC/UDP，

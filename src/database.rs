@@ -102,6 +102,15 @@ impl Database {
         .await?)
     }
 
+    pub async fn list_peers(&self) -> ResultType<Vec<Peer>> {
+        Ok(sqlx::query_as!(
+            Peer,
+            "select guid, id, uuid, pk, user, status, info from peer",
+        )
+        .fetch_all(self.pool.get().await?.deref_mut())
+        .await?)
+    }
+
     pub async fn insert_peer(
         &self,
         id: &str,
