@@ -158,7 +158,7 @@ ports.
 | `RELAY-UPSTREAM-QUIC-FALLBACK-ON-AUTH-ERROR` 🅴 | — | `N` | v1 requires `N`: certificate/pin/ALPN/token failures do not fall back to TCP; only network failures do. |
 | `RELAY-BOT-TOKEN-SECRET` 🅴 | — | *(empty)* | HMAC secret for RustBot data-plane relay tokens. Required when the QUIC listener is enabled or `RELAY-UPSTREAM-QUIC` is configured. |
 | `RELAY-QUIC-MAX-CONN` / `RELAY-QUIC-MAX-CONN-PER-IP` 🅴 | — | `10000` / `64` | Global and per-IP QUIC connection limits. |
-| `RELAY-SERVICES` 🅴 | — | *(empty)* | Master-only allowlist of service IDs and their local endpoints: `rustnet.management=unix:/run/rustbot-api/management.sock` or `name=tcp:127.0.0.1:21202`. Comma-separated. A relay with an upstream must not set it, and it requires `RELAY-BOT-TOKEN-SECRET`. |
+| `RELAY-SERVICES` 🅴 | — | *(empty)* | Allowlist of service IDs and their endpoints: `rustnet.management=unix:/run/rustbot-api/management.sock` or `name=tcp:127.0.0.1:21202`. Comma-separated. It requires `RELAY-BOT-TOKEN-SECRET`. An edge relay may set it too: declared service IDs are served locally and take precedence over the upstream, everything else is forwarded. A `tcp:` target may be any address the relay itself can reach, so list only what the site is allowed to expose. |
 | `RELAY-SERVICE-TIMEOUT-MS` 🅴 | — | `3000` | Timeout for connecting the configured local endpoint. Allowed range `100`–`30000`. |
 
 > QUIC v1 is pin-only. The relay certificate should be self-signed (the generated default
@@ -171,9 +171,10 @@ ports.
 
 A client can open a named service instead of pairing with another peer. The first packet uses
 its own marker ahead of the existing length frame, so peer traffic and `RendezvousMessage`
-are unchanged. An edge relay forwards the request to its configured upstream; a relay with
-`RELAY-SERVICES` validates the admission proof, connects the declared local endpoint, replies
-with a result code, and then forwards bytes. Clients cannot supply a target address, and
+are unchanged. A relay first matches `RELAY-SERVICES`: a declared service ID is validated,
+connected locally, answered with a result code, and then forwarded as raw bytes. Anything
+not declared is forwarded to the upstream on an edge relay, and rejected with
+`service_not_found` elsewhere. Clients cannot supply a target address, and
 service IDs that are not configured return `service_not_found`.
 
 The admission proof is an HMAC over the protocol version, service ID, and request ID, derived

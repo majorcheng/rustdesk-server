@@ -151,7 +151,7 @@ fn build_runtime_options(
         parse_service_timeout(&crate::common::get_arg("RELAY_SERVICE_TIMEOUT_MS"))?;
     let has_upstream = !upstream_tcp.is_empty() || !upstream_quic.is_empty();
     if !services.is_empty() && has_upstream {
-        bail!("RELAY_SERVICES cannot be combined with a relay upstream");
+        log::info!("RELAY_SERVICES takes precedence over the upstream for declared service IDs");
     }
     if !services.is_empty() && token_secret.is_empty() {
         bail!("RELAY_BOT_TOKEN_SECRET is required when RELAY_SERVICES is configured");
@@ -866,6 +866,26 @@ async fn handle_service_frame(
         stream.close_auth_failed();
         return;
     }
+    // 本地声明的服务优先。叶子可以既转发 upstream 又提供本地出口，
+    // 同名的服务以本站点声明为准。
+    if let Some(target) = options.services.get(&request.service_id) {
+        match connect_local_service(target, options.service_timeout).await {
+            Ok(mut peer) => {
+                log::info!("Service {} from {} is connected", request.service_id, addr);
+                send_service_result(&mut stream, &request, ServiceCode::Ok).await;
+                relay_pair(stream, &mut peer, addr, limiter).await;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Service {} local target is unavailable: {:#}",
+                    request.service_id,
+                    err
+                );
+                send_service_result(&mut stream, &request, ServiceCode::Unavailable).await;
+            }
+        }
+        return;
+    }
     if is_edge(options) {
         let Some((mut peer, transport, fallback)) =
             open_upstream(options, true, &mut stream, addr).await
@@ -888,30 +908,12 @@ async fn handle_service_frame(
         relay_pair(stream, &mut peer, addr, limiter).await;
         return;
     }
-    let Some(target) = options.services.get(&request.service_id) else {
-        log::info!(
-            "Service {} is not configured on this relay ({})",
-            request.service_id,
-            addr
-        );
-        send_service_result(&mut stream, &request, ServiceCode::NotFound).await;
-        return;
-    };
-    match connect_local_service(target, options.service_timeout).await {
-        Ok(mut peer) => {
-            log::info!("Service {} from {} is connected", request.service_id, addr);
-            send_service_result(&mut stream, &request, ServiceCode::Ok).await;
-            relay_pair(stream, &mut peer, addr, limiter).await;
-        }
-        Err(err) => {
-            log::warn!(
-                "Service {} local target is unavailable: {:#}",
-                request.service_id,
-                err
-            );
-            send_service_result(&mut stream, &request, ServiceCode::Unavailable).await;
-        }
-    }
+    log::info!(
+        "Service {} is not configured on this relay ({})",
+        request.service_id,
+        addr
+    );
+    send_service_result(&mut stream, &request, ServiceCode::NotFound).await;
 }
 
 async fn send_service_result(
@@ -1477,6 +1479,123 @@ mod edge_tests {
 
         upstream_task.await?;
         edge_task.abort();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod leaf_service_tests {
+    use super::*;
+
+    async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+        let len = payload.len();
+        let head_len = if len <= 0x3f {
+            1
+        } else if len <= 0x3fff {
+            2
+        } else {
+            3
+        };
+        let encoded = ((len as u32) << 2) | (head_len as u32 - 1);
+        stream.write_all(&encoded.to_le_bytes()[..head_len]).await?;
+        stream.write_all(payload).await
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut head = [0u8; 4];
+        stream.read_exact(&mut head[..1]).await?;
+        let head_len = ((head[0] & 0x03) + 1) as usize;
+        if head_len > 1 {
+            stream.read_exact(&mut head[1..head_len]).await?;
+        }
+        let len = (u32::from_le_bytes(head) >> 2) as usize;
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).await?;
+        Ok(payload)
+    }
+
+    fn request(service_id: &str) -> service::ServiceRequest {
+        let request_id = [9u8; 16];
+        service::ServiceRequest {
+            version: service::VERSION,
+            service_id: service_id.to_owned(),
+            request_id,
+            proof: service::proof("secret", service::VERSION, service_id, &request_id),
+        }
+    }
+
+    /// 叶子同时配了 upstream 和本地服务时，声明的 service ID 走本地，其余才转发。
+    #[tokio::test]
+    async fn leaf_serves_declared_service_locally_and_forwards_the_rest() -> ResultType<()> {
+        let local = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = local.local_addr()?;
+        let local_task = tokio::spawn(async move {
+            let (mut socket, _) = local.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            socket.read_exact(&mut buf).await.unwrap();
+            socket.write_all(&buf).await.unwrap();
+            socket.shutdown().await.ok();
+        });
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await?;
+        let upstream_addr = upstream.local_addr()?;
+
+        let mut services = HashMap::new();
+        services.insert(
+            "rustnet.observer".to_owned(),
+            ServiceTarget::Tcp(local_addr.to_string()),
+        );
+        let options = Arc::new(RelayOptions {
+            key: String::new(),
+            token_secret: "secret".to_owned(),
+            upstream: UpstreamConfig {
+                quic_addr: String::new(),
+                tcp_addr: upstream_addr.to_string(),
+                pin: None,
+                sni: String::new(),
+                ipv6: IpPreference::Off,
+            },
+            services,
+            service_timeout: Duration::from_millis(2_000),
+        });
+
+        let leaf = TcpListener::bind("127.0.0.1:0").await?;
+        let leaf_addr = leaf.local_addr()?;
+        let leaf_options = options.clone();
+        let leaf_task = tokio::spawn(async move {
+            let (stream, addr) = leaf.accept().await.unwrap();
+            make_pair_(
+                FramedStream::from(stream, addr),
+                addr,
+                &leaf_options,
+                <Limiter>::new(1e9),
+                Transport::Tcp,
+            )
+            .await;
+        });
+
+        let mut agent = TcpStream::connect(leaf_addr).await?;
+        write_frame(&mut agent, &request("rustnet.observer").encode()).await?;
+        let payload = read_frame(&mut agent).await?;
+        let result = service::ServiceResult::parse(&payload)
+            .ok_or_else(|| anyhow::anyhow!("invalid result"))?;
+        assert_eq!(result.code, ServiceCode::Ok);
+
+        agent.write_all(b"ping").await?;
+        let mut buf = [0u8; 4];
+        agent.read_exact(&mut buf).await?;
+        assert_eq!(&buf, b"ping");
+
+        // 本地服务命中时不应该碰 upstream
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), upstream.accept())
+                .await
+                .is_err(),
+            "declared service must not be forwarded upstream"
+        );
+
+        local_task.await?;
+        leaf_task.abort();
         Ok(())
     }
 }
