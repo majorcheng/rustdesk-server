@@ -67,12 +67,20 @@ pub(crate) fn valid_service_id(value: &str) -> bool {
         })
 }
 
+/// 设备自报身份：只用于审计，从不参与准入判定。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClientInfo {
+    pub(crate) peer_id: String,
+    pub(crate) hdid: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServiceRequest {
     pub(crate) version: u8,
     pub(crate) service_id: String,
     pub(crate) request_id: [u8; REQUEST_ID_LEN],
     pub(crate) proof: [u8; PROOF_LEN],
+    pub(crate) client_info: Option<ClientInfo>,
 }
 
 impl ServiceRequest {
@@ -87,33 +95,42 @@ impl ServiceRequest {
         let mut request_id = [0u8; REQUEST_ID_LEN];
         request_id.copy_from_slice(&payload[MAGIC.len() + 1..MAGIC.len() + 1 + REQUEST_ID_LEN]);
         let id_len = payload[MAGIC.len() + 1 + REQUEST_ID_LEN] as usize;
-        if id_len == 0 || payload.len() != HEADER_LEN + id_len + PROOF_LEN {
+        if id_len == 0 || payload.len() < HEADER_LEN + id_len + PROOF_LEN {
             return None;
         }
         let service_id = std::str::from_utf8(&payload[HEADER_LEN..HEADER_LEN + id_len]).ok()?;
         if !valid_service_id(service_id) {
             return None;
         }
+        let proof_start = HEADER_LEN + id_len;
         let mut proof = [0u8; PROOF_LEN];
-        proof.copy_from_slice(&payload[HEADER_LEN + id_len..]);
+        proof.copy_from_slice(&payload[proof_start..proof_start + PROOF_LEN]);
+        let client_info = parse_client_info(&payload[proof_start + PROOF_LEN..])?;
         Some(Self {
             version,
             service_id: service_id.to_owned(),
             request_id,
             proof,
+            client_info,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn encode(&self) -> Bytes {
         let id = self.service_id.as_bytes();
-        let mut payload = Vec::with_capacity(HEADER_LEN + id.len() + PROOF_LEN);
+        let mut payload = Vec::with_capacity(HEADER_LEN + id.len() + PROOF_LEN + 64);
         payload.extend_from_slice(&MAGIC);
         payload.push(self.version);
         payload.extend_from_slice(&self.request_id);
         payload.push(id.len() as u8);
         payload.extend_from_slice(id);
         payload.extend_from_slice(&self.proof);
+        if let Some(info) = &self.client_info {
+            let mut body = Vec::with_capacity(info.peer_id.len() + info.hdid.len() + 4);
+            push_u16(&mut body, info.peer_id.as_bytes());
+            push_u16(&mut body, info.hdid.as_bytes());
+            push_u16(&mut payload, &body);
+        }
         Bytes::from(payload)
     }
 }
@@ -148,6 +165,43 @@ impl ServiceResult {
             code: ServiceCode::from_u8(payload[HEADER_LEN - 1])?,
         })
     }
+}
+
+fn push_u16(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn take_u16<'a>(input: &'a [u8], offset: &mut usize) -> Option<&'a [u8]> {
+    let end = offset.checked_add(2)?;
+    let len = u16::from_be_bytes(input.get(*offset..end)?.try_into().ok()?) as usize;
+    *offset = end;
+    let end = offset.checked_add(len)?;
+    let value = input.get(*offset..end)?;
+    *offset = end;
+    Some(value)
+}
+
+/// 尾部可选块：`u16 长度 + {peer_id, hdid}`。没有尾部视为旧客户端。
+fn parse_client_info(tail: &[u8]) -> Option<Option<ClientInfo>> {
+    if tail.is_empty() {
+        return Some(None);
+    }
+    let mut offset = 0;
+    let body = take_u16(tail, &mut offset)?;
+    if offset != tail.len() {
+        return None;
+    }
+    let mut inner = 0;
+    let peer_id = std::str::from_utf8(take_u16(body, &mut inner)?).ok()?;
+    let hdid = std::str::from_utf8(take_u16(body, &mut inner)?).ok()?;
+    if inner != body.len() || peer_id.is_empty() || peer_id.len() > 64 || hdid.len() > 255 {
+        return None;
+    }
+    Some(Some(ClientInfo {
+        peer_id: peer_id.to_owned(),
+        hdid: hdid.to_owned(),
+    }))
 }
 
 pub(crate) fn is_service_frame(payload: &[u8]) -> bool {
@@ -243,6 +297,7 @@ mod tests {
             service_id: service_id.to_owned(),
             request_id,
             proof: proof("secret", version, service_id, &request_id),
+            client_info: None,
         }
     }
 
@@ -252,6 +307,29 @@ mod tests {
         let encoded = request.encode();
         assert!(is_service_frame(&encoded));
         assert_eq!(ServiceRequest::parse(&encoded), Some(request));
+    }
+
+    #[test]
+    fn client_info_roundtrip_and_tampering() {
+        let mut request = request(1, "rustnet.observer", [4u8; REQUEST_ID_LEN]);
+        request.client_info = Some(ClientInfo {
+            peer_id: "rb-64b8716b53b1dba65ebf3f0036c15840".to_owned(),
+            hdid: "Y0PF-W74P-1PSM-ZWV9".to_owned(),
+        });
+        let encoded = request.encode();
+        assert_eq!(ServiceRequest::parse(&encoded), Some(request.clone()));
+
+        // 无尾部时保持旧格式
+        let mut legacy = request.clone();
+        legacy.client_info = None;
+        assert_eq!(ServiceRequest::parse(&legacy.encode()), Some(legacy));
+
+        // 尾部截断必须整帧被拒
+        assert!(ServiceRequest::parse(&encoded[..encoded.len() - 1]).is_none());
+        // 尾部带多余字节也必须被拒
+        let mut extra = encoded.to_vec();
+        extra.push(0);
+        assert!(ServiceRequest::parse(&extra).is_none());
     }
 
     #[test]

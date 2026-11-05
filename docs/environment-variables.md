@@ -182,6 +182,12 @@ from `RELAY-BOT-TOKEN-SECRET` with a service-specific domain. The relay licence 
 used on this path. This proves cluster membership only; device identity is verified by the
 service itself after the stream is established.
 
+A client may append an optional self-reported identity block to the first packet:
+`peer_id` and HDID. A relay serving a declared service logs it as
+`Service <id> from <ip> is connected device=<peer_id> hdid=<hdid>`, or
+`device=unknown` when absent. The block is never used for admission, so treat the logged
+identity as a searchable hint rather than proof; the source address is logged alongside.
+
 ### Relay bandwidth / QoS
 
 These have no CLI flag and can also be changed through the `hbbr`

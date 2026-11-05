@@ -871,7 +871,25 @@ async fn handle_service_frame(
     if let Some(target) = options.services.get(&request.service_id) {
         match connect_local_service(target, options.service_timeout).await {
             Ok(mut peer) => {
-                log::info!("Service {} from {} is connected", request.service_id, addr);
+                // 设备自报身份仅用于审计；查不到时保留来源地址。
+                match &request.client_info {
+                    Some(info) => log::info!(
+                        "Service {} from {} is connected device={} hdid={}",
+                        request.service_id,
+                        addr,
+                        info.peer_id,
+                        if info.hdid.is_empty() {
+                            "unknown"
+                        } else {
+                            &info.hdid
+                        }
+                    ),
+                    None => log::info!(
+                        "Service {} from {} is connected device=unknown",
+                        request.service_id,
+                        addr
+                    ),
+                }
                 send_service_result(&mut stream, &request, ServiceCode::Ok).await;
                 relay_pair(stream, &mut peer, addr, limiter).await;
             }
@@ -1278,6 +1296,7 @@ mod tests {
             service_id: service_id.to_owned(),
             request_id,
             proof: service::proof(secret, service::VERSION, service_id, &request_id),
+            client_info: None,
         }
     }
 
@@ -1465,6 +1484,7 @@ mod edge_tests {
             service_id: "test.svc".to_owned(),
             request_id,
             proof: service::proof("secret", service::VERSION, "test.svc", &request_id),
+            client_info: None,
         };
         write_frame(&mut agent, &request.encode()).await?;
         let payload = read_frame(&mut agent).await?;
@@ -1521,6 +1541,7 @@ mod leaf_service_tests {
             service_id: service_id.to_owned(),
             request_id,
             proof: service::proof("secret", service::VERSION, service_id, &request_id),
+            client_info: None,
         }
     }
 
