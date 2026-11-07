@@ -1,3 +1,14 @@
+rustdesk-server (1.1.25) UNRELEASED; urgency=medium
+
+  * Take over the local registration when only a federated lease exists for a
+    peer. A node that accepted a registration while holding a lease kept the
+    lease record, so it answered every heartbeat with request_pk and never
+    published its own lease; the master and the console stayed on the previous
+    site with an offline peer. An accepted registration now always claims the
+    local record when the current one is remote-owned or no longer reachable.
+
+ -- majorcheng <major@thu.cn>  Sat, 05 Dec 2026 20:00:00 +0800
+
 rustdesk-server (1.1.24) UNRELEASED; urgency=medium
 
   * Let an edge relay declare local services again: a declared service ID is
