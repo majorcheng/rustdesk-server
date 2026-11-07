@@ -37,6 +37,9 @@ pub(crate) struct PeerLease {
     pub(crate) uuid: Vec<u8>,
     pub(crate) pk: Vec<u8>,
     pub(crate) ip: String,
+    /// 设备恢复公钥。旧节点不发送该字段，缺省视为未登记。
+    #[serde(default)]
+    pub(crate) recovery_pk: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

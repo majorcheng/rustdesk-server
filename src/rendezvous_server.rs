@@ -3,6 +3,7 @@ use crate::federation::{
     Event as FederationEvent, Federation, ForwardKind, ForwardMessage, RemoteRoute,
 };
 use crate::peer::*;
+use crate::registration::{decide, is_rustnet_id, Incoming, RotationPayload};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -451,42 +452,58 @@ impl RendezvousServer {
                     } else if !self.check_ip_blocker(&ip, &id).await {
                         return send_rk_res(socket, addr, TOO_FREQUENT).await;
                     }
-                    let peer = self.pm.get_or(&id).await;
-                    let (changed, ip_changed) = {
-                        let peer = peer.read().await;
-                        if peer.uuid.is_empty() {
-                            (true, false)
-                        } else {
-                            if peer.uuid == rk.uuid {
-                                if peer.info.ip != ip && peer.pk != rk.pk {
-                                    log::warn!(
-                                        "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                                        id,
-                                        ip,
-                                        rk.pk,
-                                        peer.info.ip,
-                                        peer.pk,
-                                    );
-                                    drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                                }
-                            } else {
-                                log::warn!(
-                                    "Peer {} uuid mismatch: {:?} vs {:?}",
-                                    id,
-                                    rk.uuid,
-                                    peer.uuid
-                                );
-                                drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
-                            }
-                            let ip_changed = peer.info.ip != ip;
-                            (
-                                peer.uuid != rk.uuid || peer.pk != rk.pk || ip_changed,
-                                ip_changed,
+                    // 判定只看本地注册与已登记的恢复公钥；叶子租约只提供 uuid/pk 视图，
+                    // 不能拿它的来源地址参与比较。
+                    let payload = if is_rustnet_id(&id) {
+                        RotationPayload::parse(&rk.old_id)
+                    } else {
+                        None
+                    };
+                    let known = match self.pm.known_peer(&id).await {
+                        Ok(known) => known,
+                        Err(err) => {
+                            log::error!("Peer {} registration lookup failed: {}", id, err);
+                            return send_rk_res(
+                                socket,
+                                addr,
+                                register_pk_response::Result::SERVER_ERROR,
                             )
+                            .await;
                         }
                     };
+                    let recovery = match self.pm.recovery(&id).await {
+                        Ok(recovery) => recovery,
+                        Err(err) => {
+                            log::error!("Peer {} recovery lookup failed: {}", id, err);
+                            return send_rk_res(
+                                socket,
+                                addr,
+                                register_pk_response::Result::SERVER_ERROR,
+                            )
+                            .await;
+                        }
+                    };
+                    let incoming = Incoming {
+                        id: &id,
+                        uuid: &rk.uuid,
+                        pk: &rk.pk,
+                        ip: &ip,
+                    };
+                    let verdict =
+                        decide(known.as_ref(), recovery.as_deref(), &incoming, payload.as_ref());
+                    if !verdict.accept {
+                        log::warn!("Peer {} registration rejected: {}", id, verdict.reason);
+                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                    }
+                    let pk_changed = verdict.pk_changed;
+                    let local_ip_changed =
+                        known.as_ref().and_then(|known| known.local_ip.as_deref()) != Some(ip.as_str());
+                    if let Some(recovery_pk) = verdict.enroll_recovery.as_deref() {
+                        if let Err(err) = self.pm.remember_recovery(&id, recovery_pk).await {
+                            log::error!("Peer {} recovery key store failed: {}", id, err);
+                        }
+                    }
+                    let peer = self.pm.get_or(&id).await;
                     let mut req_pk = peer.read().await.reg_pk;
                     if req_pk.1.elapsed().as_secs() > 6 {
                         req_pk.0 = 0;
@@ -496,7 +513,7 @@ impl RendezvousServer {
                     req_pk.0 += 1;
                     req_pk.1 = Instant::now();
                     peer.write().await.reg_pk = req_pk;
-                    if ip_changed {
+                    if local_ip_changed {
                         let mut lock = IP_CHANGES.lock().await;
                         if let Some((tm, ips)) = lock.get_mut(&id) {
                             if tm.elapsed().as_secs() > IP_CHANGE_DUR {
@@ -515,7 +532,7 @@ impl RendezvousServer {
                             );
                         }
                     }
-                    if changed {
+                    if pk_changed || local_ip_changed {
                         self.pm
                             .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
                             .await;

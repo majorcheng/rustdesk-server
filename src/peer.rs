@@ -1,6 +1,7 @@
 use crate::common::*;
 use crate::database;
 use crate::federation::PeerLease;
+use crate::registration::KnownPeer;
 use hbb_common::{
     bytes::Bytes,
     log,
@@ -49,6 +50,10 @@ pub(crate) struct Peer {
     // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
     pub(crate) owner: String,
+    /// 已登记的恢复公钥。内存副本用于避免按心跳重复读写 `peer_recovery` 表。
+    pub(crate) recovery_pk: Bytes,
+    /// 内存副本是否已经与 `peer_recovery` 表同步过；未同步时按需读库一次。
+    pub(crate) recovery_loaded: bool,
 }
 
 impl Default for Peer {
@@ -64,6 +69,8 @@ impl Default for Peer {
             // disabled: false,
             reg_pk: (0, get_expired_time()),
             owner: String::new(),
+            recovery_pk: Bytes::new(),
+            recovery_loaded: false,
         }
     }
 }
@@ -237,18 +244,36 @@ impl PeerMap {
                 .or_insert_with(|| Arc::new(RwLock::new(Peer::default())))
                 .clone()
         };
-        let mut peer = peer.write().await;
-        if peer.owner == self.local_node
-            && (peer.last_reg_time.elapsed().as_millis() as i64) < PEER_REG_TIMEOUT_MS
-        {
-            return;
+        let store_recovery = {
+            let mut peer = peer.write().await;
+            // 只有本地注册已经失效时才让租约接管；可达的本地注册视为更新，不被远端覆盖。
+            if peer.owner == self.local_node && peer.is_reachable() {
+                return;
+            }
+            peer.socket_addr = "0.0.0.0:0".parse().unwrap_or(peer.socket_addr);
+            peer.last_reg_time = Instant::now();
+            peer.uuid = lease.uuid.into();
+            peer.pk = lease.pk.into();
+            peer.info.ip = lease.ip;
+            peer.owner = owner;
+            // 心跳会反复推动租约；只在恢复公钥真正变化时写库，避免按心跳放大写入。
+            if !lease.recovery_pk.is_empty() {
+                peer.recovery_loaded = true;
+                if peer.recovery_pk != lease.recovery_pk.as_slice() {
+                    peer.recovery_pk = lease.recovery_pk.clone().into();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if store_recovery {
+            if let Err(err) = self.db.set_recovery(&lease.id, &lease.recovery_pk).await {
+                log::error!("peer_recovery write failed for {}: {}", lease.id, err);
+            }
         }
-        peer.socket_addr = "0.0.0.0:0".parse().unwrap_or(peer.socket_addr);
-        peer.last_reg_time = Instant::now();
-        peer.uuid = lease.uuid.into();
-        peer.pk = lease.pk.into();
-        peer.info.ip = lease.ip;
-        peer.owner = owner;
     }
 
     pub(crate) async fn remove_remote(&self, owner: &str) -> Vec<String> {
@@ -283,17 +308,90 @@ impl PeerMap {
     }
 
     pub(crate) async fn snapshot(&self, id: &str) -> Option<PeerLease> {
-        let peer = self.map.read().await.get(id).cloned()?;
-        let peer = peer.read().await;
-        if peer.owner != self.local_node || peer.pk.is_empty() || !peer.is_reachable() {
-            return None;
-        }
+        let (uuid, pk, ip) = {
+            let peer = self.map.read().await.get(id).cloned()?;
+            let peer = peer.read().await;
+            if peer.owner != self.local_node || peer.pk.is_empty() || !peer.is_reachable() {
+                return None;
+            }
+            (peer.uuid.to_vec(), peer.pk.to_vec(), peer.info.ip.clone())
+        };
         Some(PeerLease {
             id: id.to_owned(),
-            uuid: peer.uuid.to_vec(),
-            pk: peer.pk.to_vec(),
-            ip: peer.info.ip.clone(),
+            uuid,
+            pk,
+            ip,
+            recovery_pk: self.recovery(id).await.ok().flatten().unwrap_or_default(),
         })
+    }
+
+    pub(crate) async fn recovery(&self, id: &str) -> ResultType<Option<Vec<u8>>> {
+        if let Some(peer) = self.get_in_memory(id).await {
+            let peer = peer.read().await;
+            if peer.recovery_loaded {
+                return Ok((!peer.recovery_pk.is_empty()).then(|| peer.recovery_pk.to_vec()));
+            }
+        }
+        let stored = self.db.get_recovery(id).await?;
+        if let Some(peer) = self.get_in_memory(id).await {
+            let mut peer = peer.write().await;
+            peer.recovery_loaded = true;
+            match stored.as_ref() {
+                Some(value) => peer.recovery_pk = value.clone().into(),
+                None => peer.recovery_pk = Bytes::new(),
+            }
+        }
+        Ok(stored)
+    }
+
+    pub(crate) async fn remember_recovery(&self, id: &str, recovery_pk: &[u8]) -> ResultType<()> {
+        if let Some(peer) = self.get_in_memory(id).await {
+            let mut peer = peer.write().await;
+            peer.recovery_pk = recovery_pk.to_vec().into();
+            peer.recovery_loaded = true;
+        }
+        self.db.set_recovery(id, recovery_pk).await
+    }
+
+    /// 注册判定可用的已有身份。
+    ///
+    /// uuid/pk 取当前视图：本地内存记录（本地注册或叶子租约）。来源 IP 只能来自本地注册，
+    /// 远端租约里的地址是对方站点看到的地址，不可比。因此租约覆盖了本地记录时，
+    /// 仍从本地 DB 行取可比来源地址。
+    pub(crate) async fn known_peer(&self, id: &str) -> ResultType<Option<KnownPeer>> {
+        if let Some(peer) = self.get_in_memory(id).await {
+            let peer = peer.read().await;
+            if !peer.uuid.is_empty() || !peer.pk.is_empty() {
+                if peer.owner == self.local_node {
+                    return Ok(Some(KnownPeer {
+                        uuid: peer.uuid.to_vec(),
+                        pk: peer.pk.to_vec(),
+                        local_ip: Some(peer.info.ip.clone()),
+                    }));
+                }
+                let uuid = peer.uuid.to_vec();
+                let pk = peer.pk.to_vec();
+                drop(peer);
+                let local_ip = self
+                    .db
+                    .get_peer(id)
+                    .await?
+                    .map(|peer| peer_info_ip(&peer));
+                return Ok(Some(KnownPeer {
+                    uuid,
+                    pk,
+                    local_ip,
+                }));
+            }
+        }
+        let Some(peer) = self.db.get_peer(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(KnownPeer {
+            local_ip: Some(peer_info_ip(&peer)),
+            uuid: peer.uuid,
+            pk: peer.pk,
+        }))
     }
 
     pub(crate) async fn snapshots(&self) -> Vec<PeerLease> {
@@ -386,6 +484,12 @@ fn directory_peer_from_peer(id: &str, peer: &Peer, local_node: &str) -> Director
     }
 }
 
+fn peer_info_ip(peer: &database::Peer) -> String {
+    serde_json::from_str::<PeerInfo>(&peer.info)
+        .unwrap_or_default()
+        .ip
+}
+
 fn directory_peer_from_db(peer: database::Peer, local_node: &str) -> DirectoryPeer {
     let info = serde_json::from_str::<PeerInfo>(&peer.info).unwrap_or_default();
     DirectoryPeer {
@@ -425,6 +529,7 @@ mod tests {
             uuid: vec![2],
             pk: vec![3],
             ip: "36.112.108.165".to_owned(),
+            recovery_pk: vec![4],
         }
     }
 
@@ -478,6 +583,37 @@ mod tests {
         assert_eq!(peer.pk.as_ref(), [1].as_slice());
         assert_eq!(peer.info.ip, "222.131.66.42");
         assert!(peer_map.remote_owner(id).await.is_none());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn known_peer_keeps_local_ip_when_lease_wins() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "rb-64b8716b53b1dba65ebf3f0036c15840";
+        peer_map
+            .db
+            .insert_peer(id, b"uuid-1", &[1u8; 32], r#"{"ip":"36.112.108.165"}"#)
+            .await
+            .unwrap();
+        // 叶子租约覆盖内存记录：uuid/pk 取租约，可比来源 IP 仍取本地注册行。
+        peer_map
+            .upsert_remote(
+                "A".to_owned(),
+                PeerLease {
+                    id: id.to_owned(),
+                    uuid: b"uuid-1".to_vec(),
+                    pk: vec![3u8; 32],
+                    ip: "10.1.100.148".to_owned(),
+                    recovery_pk: vec![4u8; 32],
+                },
+            )
+            .await;
+
+        let known = peer_map.known_peer(id).await.unwrap().expect("known peer");
+        assert_eq!(known.pk, vec![3u8; 32]);
+        assert_eq!(known.uuid, b"uuid-1".to_vec());
+        assert_eq!(known.local_ip.as_deref(), Some("36.112.108.165"));
+        // 租约携带的恢复公钥写入本地表，供后续本地轮换校验。
+        assert_eq!(peer_map.recovery(id).await.unwrap(), Some(vec![4u8; 32]));
     }
 
     #[hbb_common::tokio::test]

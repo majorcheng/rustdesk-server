@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
 use sqlx::{
-    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
+    sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, Row,
+    SqliteConnection,
 };
 use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
@@ -87,6 +88,44 @@ impl Database {
             create index if not exists index_peer_status on peer (status);
         "
         )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        // 恢复公钥独立成表：它属于设备身份，不属于本地注册行，也不应随注册清理删除。
+        // 这里用运行时查询，避免 sqlx 编译期 schema 校验依赖开发库。
+        sqlx::query(
+            "
+            create table if not exists peer_recovery (
+                id varchar(100) primary key not null,
+                recovery_pk blob not null,
+                updated_at datetime not null default(current_timestamp)
+            );
+        ",
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_recovery(&self, id: &str) -> ResultType<Option<Vec<u8>>> {
+        let row = sqlx::query("select recovery_pk from peer_recovery where id = ?")
+            .bind(id)
+            .fetch_optional(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(row.map(|row| row.get::<Vec<u8>, _>("recovery_pk")))
+    }
+
+    pub async fn set_recovery(&self, id: &str, recovery_pk: &[u8]) -> ResultType<()> {
+        sqlx::query(
+            "
+            insert into peer_recovery(id, recovery_pk, updated_at)
+            values(?, ?, current_timestamp)
+            on conflict(id) do update set
+                recovery_pk = excluded.recovery_pk,
+                updated_at = current_timestamp
+            ",
+        )
+        .bind(id)
+        .bind(recovery_pk)
         .execute(self.pool.get().await?.deref_mut())
         .await?;
         Ok(())

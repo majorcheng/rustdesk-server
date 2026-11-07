@@ -5,4 +5,5 @@ pub(crate) mod federation;
 mod federation_directory;
 mod database;
 mod peer;
+mod registration;
 mod version;
