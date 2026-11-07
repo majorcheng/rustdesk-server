@@ -1,3 +1,15 @@
+rustdesk-server (1.1.26) UNRELEASED; urgency=medium
+
+  * Deliver pending QUIC stream data before closing a relay connection.
+    Closing with CONNECTION_CLOSE right after a relay pair ended discarded
+    bytes that had just been written, so short request/response exchanges
+    lost their reply; service results and management metadata replies
+    reaching a device through an edge relay failed with "relay closed".
+    The relay now finishes the send stream and closes the connection after a
+    short grace period.
+
+ -- majorcheng <major@thu.cn>  Sat, 05 Dec 2026 22:00:00 +0800
+
 rustdesk-server (1.1.25) UNRELEASED; urgency=medium
 
   * Take over the local registration when only a federated lease exists for a
