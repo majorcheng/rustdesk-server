@@ -282,9 +282,21 @@ pub(crate) struct QuicIo {
     recv: RecvStream,
 }
 
+/// 连接关闭前留给已写入流数据的交付时间。
+const CLOSE_GRACE: Duration = Duration::from_millis(500);
+
 impl Drop for QuicIo {
     fn drop(&mut self) {
-        self.connection.close(0u32.into(), b"relay closed");
+        // 直接 CONNECTION_CLOSE 会丢弃尚未送达的流数据，短请求-响应最先命中（例如服务
+        // 结果、管理元数据回执）。先结束发送流让对端读到尾部数据，再延迟关闭连接。
+        let _ = self.send.finish();
+        let connection = self.connection.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(CLOSE_GRACE).await;
+                connection.close(0u32.into(), b"relay closed");
+            });
+        }
     }
 }
 
@@ -650,6 +662,67 @@ pub(crate) fn parse_pin(value: &str) -> ResultType<Option<[u8; 32]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 关闭 QUIC 中继连接时，已经写入的流数据必须送达对端。
+    ///
+    /// 回归背景：服务结果/管理回执这类短请求-响应在 edge 的 QUIC 入站路径上丢失，
+    /// 客户端只看到 `relay closed (code 0)`。
+    #[tokio::test]
+    async fn drop_delivers_pending_stream_data() -> ResultType<()> {
+        use hbb_common::tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["relay.local".to_owned()])?;
+        let cert = certified.cert.der().clone();
+        let pin: [u8; 32] = Sha256::digest(cert.as_ref()).into();
+        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut crypto =
+            rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key)?;
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        let quic_crypto = QuicServerConfig::try_from(crypto)?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
+        server_config.transport_config(Arc::new(transport));
+
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            std::net::UdpSocket::bind("127.0.0.1:0")?,
+            Arc::new(TokioRuntime),
+        )?;
+        let addr = endpoint.local_addr()?;
+        let server = tokio::spawn(async move {
+            let incoming = endpoint.accept().await.expect("incoming");
+            let connection = incoming.await.expect("handshake");
+            let (send, recv) = connection.accept_bi().await.expect("stream");
+            let mut io = QuicIo {
+                connection: connection.clone(),
+                send,
+                recv,
+            };
+            let mut request = [0u8; 4];
+            io.read_exact(&mut request).await.expect("read request");
+            io.write_all(b"reply").await.expect("write reply");
+            drop(io);
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        });
+
+        let client = Endpoint::new(
+            EndpointConfig::default(),
+            None,
+            std::net::UdpSocket::bind("127.0.0.1:0")?,
+            Arc::new(TokioRuntime),
+        )?;
+        let client_cfg = client_config(pin, Arc::new(AtomicBool::new(false)))?;
+        let connection = client.connect_with(client_cfg, addr, "relay.local")?.await?;
+        let (mut send, mut recv) = connection.open_bi().await?;
+        send.write_all(b"ping").await?;
+        send.finish()?;
+        let reply = recv.read_to_end(1024).await.map_err(|err| anyhow::anyhow!("{err}"))?;
+        server.await.expect("server task");
+        assert_eq!(reply, b"reply");
+        Ok(())
+    }
 
     #[test]
     fn pin_verifier_accepts_matching_self_signed_cert() {
