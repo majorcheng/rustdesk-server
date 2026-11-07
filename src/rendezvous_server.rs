@@ -532,7 +532,10 @@ impl RendezvousServer {
                             );
                         }
                     }
-                    if pk_changed || local_ip_changed {
+                    // 内存里只有远端租约或记录已失效时要接管：否则本地没有可用地址，
+                    // 会一直向设备索要 request_pk，也永远不会发布自己的租约。
+                    let takeover = self.pm.needs_local_takeover(&id).await;
+                    if pk_changed || local_ip_changed || takeover {
                         self.pm
                             .update_pk(id.clone(), peer, addr, rk.uuid, rk.pk, ip)
                             .await;

@@ -325,6 +325,20 @@ impl PeerMap {
         })
     }
 
+    /// 本地是否需要为这个 peer 建立（或接管）注册记录。
+    ///
+    /// 内存里只有远端租约、或本地记录已失效时都必须写一次：否则本节点的记录没有可用地址，
+    /// 会一直向设备索要 `request_pk`，也永远不会发布自己的租约。
+    pub(crate) async fn needs_local_takeover(&self, id: &str) -> bool {
+        match self.get_in_memory(id).await {
+            Some(peer) => {
+                let peer = peer.read().await;
+                peer.owner != self.local_node || !peer.is_reachable()
+            }
+            None => true,
+        }
+    }
+
     pub(crate) async fn recovery(&self, id: &str) -> ResultType<Option<Vec<u8>>> {
         if let Some(peer) = self.get_in_memory(id).await {
             let peer = peer.read().await;
@@ -583,6 +597,52 @@ mod tests {
         assert_eq!(peer.pk.as_ref(), [1].as_slice());
         assert_eq!(peer.info.ip, "222.131.66.42");
         assert!(peer_map.remote_owner(id).await.is_none());
+    }
+
+    #[hbb_common::tokio::test]
+    async fn takeover_is_required_when_only_a_lease_exists() {
+        let (peer_map, _directory) = test_peer_map().await;
+        let id = "rb-64b8716b53b1dba65ebf3f0036c15840";
+        assert!(peer_map.needs_local_takeover(id).await);
+
+        peer_map
+            .db
+            .insert_peer(id, b"uuid-1", &[1u8; 32], r#"{"ip":"10.1.100.148"}"#)
+            .await
+            .unwrap();
+        peer_map
+            .upsert_remote("A".to_owned(), remote_lease(id))
+            .await;
+        // 内存里是远端租约：来源地址不可比，必须由本地注册接管。
+        assert!(peer_map.needs_local_takeover(id).await);
+
+        let peer = Arc::new(RwLock::new(Peer {
+            socket_addr: "10.1.100.148:21116".parse().unwrap(),
+            last_reg_time: Instant::now(),
+            uuid: vec![1].into(),
+            pk: vec![1].into(),
+            info: PeerInfo {
+                ip: "10.1.100.148".to_owned(),
+            },
+            owner: "B".to_owned(),
+            ..Default::default()
+        }));
+        peer_map.map.write().await.insert(id.to_owned(), peer);
+        assert!(!peer_map.needs_local_takeover(id).await);
+
+        let stale = Arc::new(RwLock::new(Peer {
+            socket_addr: "10.1.100.148:21116".parse().unwrap(),
+            last_reg_time: Instant::now() - Duration::from_secs(120),
+            uuid: vec![1].into(),
+            pk: vec![1].into(),
+            info: PeerInfo {
+                ip: "10.1.100.148".to_owned(),
+            },
+            owner: "B".to_owned(),
+            ..Default::default()
+        }));
+        peer_map.map.write().await.insert(id.to_owned(), stale);
+        assert!(peer_map.needs_local_takeover(id).await);
     }
 
     #[hbb_common::tokio::test]
