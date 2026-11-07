@@ -6,6 +6,18 @@ rustdesk-server (1.1.24) UNRELEASED; urgency=medium
     can reach, without exposing a general proxy.
   * Document that a `tcp:` service target may be any address the relay can
     reach, so the allowlist is an explicit egress policy.
+  * Accept a RustBot peer registration after its local keypair is rebuilt:
+    when the registration UUID matches, a rotation statement signed by the
+    peer's SOC_UID-derived recovery key replaces the previous public key, so a
+    reflashed device can register at any site without manual cleanup.
+  * Judge a registration only against the local peer record. A federated lease
+    no longer takes part in the source-address and public-key comparison, and
+    it no longer overwrites a locally registered peer that is still reachable.
+  * Keep the recovery key in a separate peer_recovery table and carry it in
+    federation leases, so every site can verify a later rotation locally.
+  * Carry the rotation payload in RegisterPk.old_id; hbb_common's protocol and
+    the stock RustDesk registration path are unchanged, and agents that do not
+    send the payload keep the existing same-address allowance.
 
  -- majorcheng <major@thu.cn>  Sat, 05 Dec 2026 18:00:00 +0800
 
