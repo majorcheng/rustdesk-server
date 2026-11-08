@@ -152,7 +152,7 @@ pub(crate) async fn connect_upstream(
     sni: &str,
     pin: [u8; 32],
     preference: IpPreference,
-) -> Result<FramedStream, UpstreamError> {
+) -> Result<QuicRelayStream, UpstreamError> {
     let mut addresses = lookup_host(addr)
         .await
         .map_err(|err| UpstreamError::Unavailable(err.into()))?
@@ -227,12 +227,17 @@ pub(crate) async fn connect_upstream(
                 continue;
             }
         };
+        // 与入站方向一致地用 QuicRelayStream：它同时保留 Connection，
+        // edge 才能把 datagram 继续转发给 master。
         let io = QuicIo {
-            connection,
+            connection: connection.clone(),
             send,
             recv,
         };
-        return Ok(FramedStream::from(io, remote));
+        return Ok(QuicRelayStream {
+            framed: FramedStream::from(io, remote),
+            connection,
+        });
     }
     Err(UpstreamError::Unavailable(last_error.unwrap_or_else(
         || anyhow::anyhow!("failed to connect {addr}"),
@@ -364,7 +369,7 @@ impl AsyncWrite for QuicIo {
     }
 }
 
-struct QuicRelayStream {
+pub(crate) struct QuicRelayStream {
     framed: FramedStream,
     connection: Connection,
 }
@@ -890,6 +895,87 @@ mod tests {
         Ok(())
     }
 
+    /// edge → master 链路：两跳都是 QUIC 时 datagram 必须端到端转发。
+    ///
+    /// upstream 曾经把 `Connection` 藏在 `FramedStream` 里，datagram 在 edge 就断了。
+    #[tokio::test]
+    async fn datagram_is_forwarded_across_edge_to_master() -> ResultType<()> {
+        let (master_endpoint, master_addr, master_pin) = quic_relay_endpoint().await?;
+        let (edge_endpoint, edge_addr, edge_pin) = quic_relay_endpoint().await?;
+
+        // master：先接设备，再接 edge 的 upstream，两者配对。
+        let master_task = tokio::spawn({
+            let endpoint = master_endpoint.clone();
+            async move {
+                let device = endpoint.accept().await.expect("incoming");
+                let device = accept_relay_stream(device.await.expect("handshake"), master_addr)
+                    .await
+                    .expect("device stream");
+                let edge = endpoint.accept().await.expect("incoming");
+                let upstream = accept_relay_stream(edge.await.expect("handshake"), master_addr)
+                    .await
+                    .expect("upstream stream");
+                let mut peer: Box<dyn crate::relay_server::StreamTrait> = Box::new(device);
+                crate::relay_server::relay_pair(
+                    upstream,
+                    &mut peer,
+                    master_addr,
+                    Limiter::new(1_000_000_000.),
+                )
+                .await;
+            }
+        });
+
+        // edge：接设备，再连 master，两跳配对。upstream 必须保留 datagram 出口。
+        let edge_task = tokio::spawn({
+            let endpoint = edge_endpoint.clone();
+            async move {
+                let device = endpoint.accept().await.expect("incoming");
+                let inbound = accept_relay_stream(device.await.expect("handshake"), edge_addr)
+                    .await
+                    .expect("inbound stream");
+                let upstream =
+                    connect_upstream(&master_addr.to_string(), "", master_pin, IpPreference::Off)
+                        .await
+                        .expect("edge connects master");
+                let mut peer: Box<dyn crate::relay_server::StreamTrait> = Box::new(upstream);
+                crate::relay_server::relay_pair(
+                    inbound,
+                    &mut peer,
+                    edge_addr,
+                    Limiter::new(1_000_000_000.),
+                )
+                .await;
+            }
+        });
+
+        // master 按接入顺序配对，所以先连设备 B。
+        let (_device_b_endpoint, device_b) = connect_quic_client(master_addr, master_pin).await?;
+        let (mut send_b, _recv_b) = device_b.open_bi().await?;
+        send_b.write_all(b"b").await?;
+
+        let (_device_a_endpoint, device_a) = connect_quic_client(edge_addr, edge_pin).await?;
+        let (mut send_a, _recv_a) = device_a.open_bi().await?;
+        send_a.write_all(b"a").await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        device_a.send_datagram(Bytes::from_static(b"a-to-b"))?;
+        let received = tokio::time::timeout(Duration::from_secs(2), device_b.read_datagram())
+            .await
+            .map_err(|_| anyhow::anyhow!("datagram 未跨 edge 到达 master 侧设备"))??;
+        assert_eq!(&received[..], b"a-to-b");
+
+        device_b.send_datagram(Bytes::from_static(b"b-to-a"))?;
+        let received = tokio::time::timeout(Duration::from_secs(2), device_a.read_datagram())
+            .await
+            .map_err(|_| anyhow::anyhow!("反向 datagram 未跨 master 到达 edge 侧设备"))??;
+        assert_eq!(&received[..], b"b-to-a");
+
+        master_task.abort();
+        edge_task.abort();
+        Ok(())
+    }
+
     /// 对端没有 datagram 能力时丢弃 datagram，业务流照常转发。
     #[tokio::test]
     async fn datagram_is_dropped_when_peer_has_no_datagram_support() -> ResultType<()> {
@@ -1099,6 +1185,7 @@ mod integration_tests {
             .await
             .expect("first pinned client connects");
         first
+            .framed
             .send(&request(test_token(secret, uuid)))
             .await
             .expect("send first relay request");
@@ -1107,15 +1194,17 @@ mod integration_tests {
             .await
             .expect("second pinned client connects");
         second
+            .framed
             .send(&request(test_token(secret, uuid)))
             .await
             .expect("send second relay request");
 
         first
+            .framed
             .send_bytes(Bytes::from_static(b"ping"))
             .await
             .expect("send relayed bytes");
-        let received = tokio::time::timeout(Duration::from_secs(2), second.next())
+        let received = tokio::time::timeout(Duration::from_secs(2), second.framed.next())
             .await
             .expect("relay timeout")
             .expect("relay closed")
@@ -1126,10 +1215,11 @@ mod integration_tests {
             .await
             .expect("bad-token client connects");
         bad_token
+            .framed
             .send(&request(test_token("wrong-secret", uuid)))
             .await
             .expect("send bad token request");
-        let closed = tokio::time::timeout(Duration::from_secs(2), bad_token.next()).await;
+        let closed = tokio::time::timeout(Duration::from_secs(2), bad_token.framed.next()).await;
         assert!(
             !matches!(closed, Ok(Some(Ok(_)))),
             "invalid token must close the stream"
@@ -1220,7 +1310,11 @@ mod ipv6_tests {
         request.conn_type = ConnType::PORT_FORWARD.into();
         let mut message = RendezvousMessage::new();
         message.set_request_relay(request);
-        stream.send(&message).await.expect("send relay request");
+        stream
+            .framed
+            .send(&message)
+            .await
+            .expect("send relay request");
 
         listener.abort();
         drop(stream);
