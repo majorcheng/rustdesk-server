@@ -607,6 +607,23 @@ impl RendezvousServer {
                         socket.send(&msg_out, addr).await?;
                     }
                 }
+                // UDP 版 NAT 测试：返回本端观察到的源端口，供对端构造 UDP 候选。
+                // 上游客户端只在 TCP 上做 NAT 测试，因此这里新增分支不影响兼容性。
+                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
+                    let mut msg_out = RendezvousMessage::new();
+                    let mut res = TestNatResponse {
+                        port: addr.port() as _,
+                        ..Default::default()
+                    };
+                    if self.inner.serial > tar.serial {
+                        let mut cu = ConfigUpdate::new();
+                        cu.serial = self.inner.serial;
+                        cu.rendezvous_servers = (*self.rendezvous_servers).clone();
+                        res.cu = MessageField::from_option(Some(cu));
+                    }
+                    msg_out.set_test_nat_response(res);
+                    socket.send(&msg_out, addr).await?;
+                }
                 _ => {}
             }
         }
