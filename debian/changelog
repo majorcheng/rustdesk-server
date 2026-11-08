@@ -1,3 +1,15 @@
+rustdesk-server (1.1.28) UNRELEASED; urgency=medium
+
+  * Answer UDP NAT requests on the rendezvous port. TestNatRequest was only
+    handled on the TCP paths, so a client that asked over UDP never received
+    TestNatResponse and could not learn its observed source port. Clients that
+    build UDP candidate addresses for hole punching therefore fell back to TCP
+    or relay every time. The UDP handler now replies with the observed source
+    port, mirroring the TCP semantics; existing clients are unaffected because
+    they only ask over TCP.
+
+ -- majorcheng <major@thu.cn>  Sun, 08 Nov 2026 21:00:00 +0800
+
 rustdesk-server (1.1.27) UNRELEASED; urgency=medium
 
   * Forward unreliable QUIC datagrams between paired relay peers. Stream
