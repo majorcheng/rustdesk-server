@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use hbb_common::{
     anyhow,
     base64::{engine::general_purpose::STANDARD, Engine as _},
-    bytes::Bytes,
+    bytes::{Bytes, BytesMut},
     log,
     sha2::{Digest, Sha256},
     sodiumoxide::{self, crypto::auth::hmacsha256},
@@ -20,8 +20,8 @@ use hbb_common::{
 use quinn::{
     congestion::BbrConfig,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
-    ClientConfig, Connection, ConnectionError, Endpoint, EndpointConfig, RecvStream, SendStream,
-    ServerConfig, TokioRuntime, TransportConfig,
+    ClientConfig, Connection, ConnectionError, Endpoint, EndpointConfig, RecvStream,
+    SendDatagramError, SendStream, ServerConfig, TokioRuntime, TransportConfig,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -89,6 +89,7 @@ pub(crate) async fn start_listener(
     transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
     transport.max_concurrent_bidi_streams(1u32.into());
     transport.max_concurrent_uni_streams(0u32.into());
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
     server_config.transport_config(Arc::new(transport));
 
     let socket = bind_udp_socket(bind, port)?;
@@ -271,9 +272,40 @@ fn client_config(
     transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
     transport.keep_alive_interval(Some(KEEP_ALIVE));
     transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
     let mut config = ClientConfig::new(Arc::new(quic));
     config.transport_config(Arc::new(transport));
     Ok(config)
+}
+
+/// relay datagram 的接收缓冲。
+///
+/// 显式设置而不是依赖 quinn 默认值：默认值随版本变化，一旦退化成 0 个包，
+/// QUIC stream 仍然正常，只有 datagram 静默丢失。
+const DATAGRAM_RECV_BUFFER: usize = 1024 * 1024;
+
+/// relay 转发 datagram 用的独立句柄。
+///
+/// 与 `QuicRelayStream` 分离持有同一个 `Connection`，这样 relay 可以同时轮询
+/// 两个方向的 stream 与 datagram，而不需要同时可变借用同一个对象。
+#[derive(Clone)]
+pub(crate) struct DatagramHandle {
+    connection: Connection,
+}
+
+impl DatagramHandle {
+    /// 读一条 datagram。错误保留类型：调用方需要区分连接结束与可恢复错误。
+    pub(crate) async fn recv(&self) -> Result<BytesMut, ConnectionError> {
+        self.connection
+            .read_datagram()
+            .await
+            .map(|bytes| BytesMut::from(&bytes[..]))
+    }
+
+    /// 发一条 datagram。`TooLarge` 表示协商出的 MTU 与实际不符。
+    pub(crate) fn send(&self, bytes: Bytes) -> Result<(), SendDatagramError> {
+        self.connection.send_datagram(bytes)
+    }
 }
 
 pub(crate) struct QuicIo {
@@ -366,6 +398,12 @@ impl crate::relay_server::StreamTrait for QuicRelayStream {
 
     fn close_auth_failed(&mut self) {
         self.close_auth_failed();
+    }
+
+    fn datagram_handle(&self) -> Option<DatagramHandle> {
+        Some(DatagramHandle {
+            connection: self.connection.clone(),
+        })
     }
 }
 
@@ -675,8 +713,9 @@ mod tests {
         let cert = certified.cert.der().clone();
         let pin: [u8; 32] = Sha256::digest(cert.as_ref()).into();
         let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
-        let mut crypto =
-            rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert], key)?;
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)?;
         crypto.alpn_protocols = vec![ALPN.to_vec()];
         let quic_crypto = QuicServerConfig::try_from(crypto)?;
         let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -714,14 +753,220 @@ mod tests {
             Arc::new(TokioRuntime),
         )?;
         let client_cfg = client_config(pin, Arc::new(AtomicBool::new(false)))?;
-        let connection = client.connect_with(client_cfg, addr, "relay.local")?.await?;
+        let connection = client
+            .connect_with(client_cfg, addr, "relay.local")?
+            .await?;
         let (mut send, mut recv) = connection.open_bi().await?;
         send.write_all(b"ping").await?;
         send.finish()?;
-        let reply = recv.read_to_end(1024).await.map_err(|err| anyhow::anyhow!("{err}"))?;
+        let reply = recv
+            .read_to_end(1024)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
         server.await.expect("server task");
         assert_eq!(reply, b"reply");
         Ok(())
+    }
+
+    /// 起 QUIC relay 服务端，返回 endpoint、监听地址与证书 pin。
+    ///
+    /// endpoint 必须由调用方持有：丢弃它等于关闭 relay。
+    async fn quic_relay_endpoint() -> ResultType<(Endpoint, SocketAddr, [u8; 32])> {
+        let certified = rcgen::generate_simple_self_signed(vec!["relay.local".to_owned()])?;
+        let cert = certified.cert.der().clone();
+        let pin: [u8; 32] = Sha256::digest(cert.as_ref()).into();
+        let key = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)?;
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        let quic_crypto = QuicServerConfig::try_from(crypto)?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
+        transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+        server_config.transport_config(Arc::new(transport));
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            std::net::UdpSocket::bind("127.0.0.1:0")?,
+            Arc::new(TokioRuntime),
+        )?;
+        let addr = endpoint.local_addr()?;
+        Ok((endpoint, addr, pin))
+    }
+
+    /// 客户端建连。返回的 endpoint 同样必须由调用方持有。
+    async fn connect_quic_client(
+        addr: SocketAddr,
+        pin: [u8; 32],
+    ) -> ResultType<(Endpoint, Connection)> {
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            None,
+            std::net::UdpSocket::bind("127.0.0.1:0")?,
+            Arc::new(TokioRuntime),
+        )?;
+        let connection = endpoint
+            .connect_with(
+                client_config(pin, Arc::new(AtomicBool::new(false)))?,
+                addr,
+                "relay.local",
+            )?
+            .await?;
+        Ok((endpoint, connection))
+    }
+
+    /// 服务端接受一条 bidi 流并组装成 relay 用的 stream。
+    async fn accept_relay_stream(
+        connection: Connection,
+        addr: SocketAddr,
+    ) -> ResultType<QuicRelayStream> {
+        let (send, recv) = connection.accept_bi().await?;
+        let io = QuicIo {
+            connection: connection.clone(),
+            send,
+            recv,
+        };
+        Ok(QuicRelayStream {
+            framed: FramedStream::from(io, addr),
+            connection,
+        })
+    }
+
+    /// relay 必须把一侧的 QUIC datagram 原样转发到另一侧，与 stream 互不影响。
+    #[tokio::test]
+    async fn datagram_is_forwarded_between_paired_peers() -> ResultType<()> {
+        let (endpoint, addr, pin) = quic_relay_endpoint().await?;
+        let relay_task = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                // 先把两条连接都握完，再取流：QUIC 的 bidi 流要等首帧发出才对端可见，
+                // 边接边等会与客户端的建连顺序互相卡住。
+                let mut connections = Vec::new();
+                for _ in 0..2 {
+                    let incoming = endpoint.accept().await.expect("incoming");
+                    connections.push(incoming.await.expect("handshake"));
+                }
+                let mut streams = Vec::new();
+                for connection in connections {
+                    streams.push(accept_relay_stream(connection, addr).await.expect("stream"));
+                }
+                let peer_stream = streams.pop().expect("peer");
+                let inbound = streams.pop().expect("inbound");
+                let mut peer: Box<dyn crate::relay_server::StreamTrait> = Box::new(peer_stream);
+                crate::relay_server::relay_pair(
+                    inbound,
+                    &mut peer,
+                    addr,
+                    Limiter::new(1_000_000_000.),
+                )
+                .await;
+            }
+        });
+
+        let (_client_a, conn_a) = connect_quic_client(addr, pin).await?;
+        let (mut send_a, _recv_a) = conn_a.open_bi().await?;
+        // 首帧让服务端的 accept_bi 返回；之后 stream 保持打开，relay 以它判断会话存活。
+        send_a.write_all(b"a").await?;
+        let (_client_b, conn_b) = connect_quic_client(addr, pin).await?;
+        let (mut send_b, _recv_b) = conn_b.open_bi().await?;
+        send_b.write_all(b"b").await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        conn_a.send_datagram(Bytes::from_static(b"ping-datagram"))?;
+        let received = tokio::time::timeout(Duration::from_secs(2), conn_b.read_datagram())
+            .await
+            .map_err(|_| anyhow::anyhow!("datagram 未在 2 秒内到达对端"))??;
+        assert_eq!(&received[..], b"ping-datagram");
+
+        conn_b.send_datagram(Bytes::from_static(b"pong-datagram"))?;
+        let received = tokio::time::timeout(Duration::from_secs(2), conn_a.read_datagram())
+            .await
+            .map_err(|_| anyhow::anyhow!("反向 datagram 未在 2 秒内到达对端"))??;
+        assert_eq!(&received[..], b"pong-datagram");
+
+        relay_task.abort();
+        Ok(())
+    }
+
+    /// 对端没有 datagram 能力时丢弃 datagram，业务流照常转发。
+    #[tokio::test]
+    async fn datagram_is_dropped_when_peer_has_no_datagram_support() -> ResultType<()> {
+        let (endpoint, addr, pin) = quic_relay_endpoint().await?;
+        let (peer_io, mut legacy_io) = tokio::io::duplex(64 * 1024);
+        let relay_task = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move {
+                let incoming = endpoint.accept().await.expect("incoming");
+                let connection = incoming.await.expect("handshake");
+                let inbound = accept_relay_stream(connection, addr).await.expect("stream");
+                // legacy peer：trait 默认实现返回 None，没有 datagram 出口。
+                let mut peer: Box<dyn crate::relay_server::StreamTrait> =
+                    Box::new(FramedStream::from(peer_io, addr));
+                crate::relay_server::relay_pair(
+                    inbound,
+                    &mut peer,
+                    addr,
+                    Limiter::new(1_000_000_000.),
+                )
+                .await;
+            }
+        });
+
+        let (_client, conn) = connect_quic_client(addr, pin).await?;
+        let (mut send, _recv) = conn.open_bi().await?;
+        // 先确认 relay 已经转发业务流，再发 datagram：否则 datagram 可能在
+        // relay 尚未处理时就被丢弃，断言失去意义。
+        send.write_all(b"before").await?;
+        let mut seen = read_until(&mut legacy_io, b"before").await?;
+
+        conn.send_datagram(Bytes::from_static(b"dropped-datagram"))?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        send.write_all(b"after").await?;
+        seen.extend_from_slice(&read_until(&mut legacy_io, b"after").await?);
+        assert!(
+            !contains(&seen, b"dropped-datagram"),
+            "datagram 不应落进 stream"
+        );
+
+        relay_task.abort();
+        Ok(())
+    }
+
+    /// 从 legacy peer 侧读到 needle 为止；超时说明 relay 已经不再转发。
+    async fn read_until(
+        io: &mut tokio::io::DuplexStream,
+        needle: &[u8],
+    ) -> ResultType<Vec<u8>> {
+        use hbb_common::tokio::io::AsyncReadExt;
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        let read = async {
+            while !contains(&seen, needle) {
+                let n = io.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .map_err(|_| anyhow::anyhow!("legacy peer 未在 2 秒内收到 {needle:?}"))??;
+        if !contains(&seen, needle) {
+            anyhow::bail!("legacy peer 已断开，未收到 {needle:?}");
+        }
+        Ok(seen)
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[test]

@@ -33,6 +33,7 @@ use std::{
 };
 
 use crate::quic_relay::{self, IpPreference};
+use quinn::SendDatagramError;
 use crate::service::{self, ServiceCode, ServiceRequest, ServiceTarget};
 
 type Usage = (usize, usize, usize, usize);
@@ -1012,7 +1013,7 @@ async fn relay_local(
     }
 }
 
-async fn relay_pair(
+pub(crate) async fn relay_pair(
     mut stream: impl StreamTrait,
     peer: &mut Box<dyn StreamTrait>,
     addr: SocketAddr,
@@ -1031,6 +1032,33 @@ async fn relay_pair(
         log::info!("Relay of {} closed", addr);
     }
     USAGE.write().await.remove(&id);
+}
+
+/// 转发一条 relay datagram。
+///
+/// 单端没有 datagram 能力时静默丢弃：该端走 legacy stream，由发送侧按自己的超时重传。
+/// `TooLarge` 说明协商 MTU 与实际不符，只告警一次；其余错误记 debug，避免 KCP
+/// 高频发送时刷日志。
+fn forward_datagram(
+    addr: SocketAddr,
+    direction: &str,
+    bytes: BytesMut,
+    target: Option<&crate::quic_relay::DatagramHandle>,
+    logged_too_large: &mut bool,
+) {
+    let Some(target) = target else {
+        return;
+    };
+    match target.send(bytes.freeze()) {
+        Ok(()) => {}
+        Err(SendDatagramError::TooLarge) => {
+            if !*logged_too_large {
+                *logged_too_large = true;
+                log::warn!("Relay datagram to {addr} too large ({direction}); check negotiated MTU");
+            }
+        }
+        Err(err) => log::debug!("Relay datagram to {addr} dropped ({direction}): {err}"),
+    }
 }
 
 async fn relay(
@@ -1055,6 +1083,20 @@ async fn relay(
         (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
+    // datagram 只在两端都支持时转发；单端支持说明另一端走了 legacy stream，
+    // 此时丢弃并由发送侧重传，不能影响控制与业务流。
+    let mut stream_dg = stream.datagram_handle();
+    let mut peer_dg = peer.datagram_handle();
+    if stream_dg.is_some() != peer_dg.is_some() {
+        log::info!(
+            "Relay datagram disabled for {}: inbound={} peer={}",
+            addr,
+            stream_dg.is_some(),
+            peer_dg.is_some()
+        );
+    }
+    // TooLarge 是系统性错误（MTU 协商不一致），每次会话只告警一次。
+    let mut logged_too_large = false;
     loop {
         tokio::select! {
             res = peer.recv() => {
@@ -1093,6 +1135,73 @@ async fn relay(
                     }
                 } else {
                     break;
+                }
+            },
+            // 用克隆构造 future：select! 会先求值 future 再判 guard，
+            // 直接在 future 里 expect 会在 peer_dg 为 None 时 panic。
+            res = async {
+                match peer_dg.clone() {
+                    Some(handle) => handle.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match res {
+                    Ok(bytes) => {
+                        last_recv_time = std::time::Instant::now();
+                        let nb = bytes.len() * 8;
+                        if blacked || downgrade {
+                            blacklist_limiter.consume(nb).await;
+                        } else {
+                            limiter.consume(nb).await;
+                        }
+                        total_limiter.consume(nb).await;
+                        total += nb;
+                        total_s += nb;
+                        forward_datagram(
+                            addr,
+                            "peer->inbound",
+                            bytes,
+                            stream_dg.as_ref(),
+                            &mut logged_too_large,
+                        );
+                    }
+                    // datagram 通道失效不影响 stream：只停止监听该方向。
+                    Err(err) => {
+                        log::debug!("Relay datagram from peer {addr} ended: {err}");
+                        peer_dg = None;
+                    }
+                }
+            },
+            res = async {
+                match stream_dg.clone() {
+                    Some(handle) => handle.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match res {
+                    Ok(bytes) => {
+                        last_recv_time = std::time::Instant::now();
+                        let nb = bytes.len() * 8;
+                        if blacked || downgrade {
+                            blacklist_limiter.consume(nb).await;
+                        } else {
+                            limiter.consume(nb).await;
+                        }
+                        total_limiter.consume(nb).await;
+                        total += nb;
+                        total_s += nb;
+                        forward_datagram(
+                            addr,
+                            "inbound->peer",
+                            bytes,
+                            peer_dg.as_ref(),
+                            &mut logged_too_large,
+                        );
+                    }
+                    Err(err) => {
+                        log::debug!("Relay datagram from inbound {addr} ended: {err}");
+                        stream_dg = None;
+                    }
                 }
             },
             _ = timer.tick() => {
@@ -1165,6 +1274,14 @@ pub(crate) trait StreamTrait: Send + Sync + 'static {
     fn is_ws(&self) -> bool;
     fn set_raw(&mut self);
     fn close_auth_failed(&mut self) {}
+
+    /// 该传输的无序 datagram 出口（目前只有 QUIC）。
+    ///
+    /// 返回独立句柄而不是在 stream 上开方法：relay 需要同时轮询两个方向的 stream
+    /// 与 datagram，共用 `&mut self` 会互相借用冲突。
+    fn datagram_handle(&self) -> Option<crate::quic_relay::DatagramHandle> {
+        None
+    }
 }
 
 #[async_trait]
