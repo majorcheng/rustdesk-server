@@ -85,6 +85,8 @@ struct QuicListenerConfig {
     enabled: bool,
     bind: Option<IpAddr>,
     port: u16,
+    /// `RELAY_QUIC_EXTRA_PORTS`：同一进程额外监听的 QUIC 端口，与 `port` 共用配对表和证书。
+    extra_ports: Vec<u16>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
 }
@@ -198,18 +200,44 @@ fn build_runtime_options(
         services,
         service_timeout,
     });
+    let quic_port = crate::common::get_arg("RELAY_QUIC_PORT")
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(port);
     let config = QuicListenerConfig {
         enabled: quic_enabled,
         bind: parse_quic_bind(&crate::common::get_arg("RELAY_QUIC_BIND"))?.or(bind_addr),
-        port: crate::common::get_arg("RELAY_QUIC_PORT")
-            .parse::<u16>()
-            .ok()
-            .filter(|value| *value > 0)
-            .unwrap_or(port),
+        port: quic_port,
+        extra_ports: parse_quic_extra_ports(
+            &crate::common::get_arg("RELAY_QUIC_EXTRA_PORTS"),
+            quic_port,
+        )?,
         cert: path_arg("RELAY_QUIC_CERT"),
         key: path_arg("RELAY_QUIC_KEY"),
     };
     Ok((options, config))
+}
+
+/// 解析逗号分隔的额外 QUIC 端口。配错时拒绝启动，不静默忽略。
+fn parse_quic_extra_ports(value: &str, primary: u16) -> ResultType<Vec<u16>> {
+    let mut ports = Vec::new();
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        let port = item
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid RELAY_QUIC_EXTRA_PORTS entry: {item}"))?;
+        if port == primary || ports.contains(&port) {
+            bail!("duplicate QUIC port in RELAY_QUIC_EXTRA_PORTS: {port}");
+        }
+        ports.push(port);
+    }
+    Ok(ports)
 }
 
 fn parse_service_timeout(value: &str) -> ResultType<Duration> {
@@ -283,21 +311,36 @@ async fn run_quic_loop(
     if !config.enabled {
         return std::future::pending().await;
     }
-    loop {
-        if let Err(err) = quic_relay::start_listener(
-            config.bind,
-            config.port,
-            config.cert.clone(),
-            config.key.clone(),
-            options.clone(),
-            limiter.clone(),
-        )
-        .await
-        {
-            log::error!("quic listener failed: {}", err);
+    let quic = loop {
+        match quic_relay::QuicListener::new(config.cert.clone(), config.key.clone()) {
+            Ok(quic) => break Arc::new(quic),
+            Err(err) => log::error!("quic listener failed: {}", err),
         }
         sleep(1.).await;
+    };
+    let mut listeners = tokio::task::JoinSet::new();
+    for port in std::iter::once(config.port).chain(config.extra_ports.iter().copied()) {
+        let quic = quic.clone();
+        let options = options.clone();
+        let limiter = limiter.clone();
+        listeners.spawn(async move {
+            loop {
+                if let Err(err) = quic
+                    .serve(config.bind, port, options.clone(), limiter.clone())
+                    .await
+                {
+                    log::error!("quic listener on udp/{} failed: {}", port, err);
+                }
+                sleep(1.).await;
+            }
+        });
     }
+    while let Some(result) = listeners.join_next().await {
+        if let Err(err) = result {
+            log::error!("quic listener task stopped: {}", err);
+        }
+    }
+    bail!("all quic listeners stopped")
 }
 
 fn parse_flag(name: &str) -> bool {
@@ -1451,6 +1494,23 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_extra_ports_parse_and_reject_conflicts() {
+        assert_eq!(
+            parse_quic_extra_ports("", 21117).unwrap(),
+            Vec::<u16>::new()
+        );
+        assert_eq!(
+            parse_quic_extra_ports(" 5443 , 6443 ", 21117).unwrap(),
+            vec![5443, 6443]
+        );
+        assert!(parse_quic_extra_ports("21117", 21117).is_err());
+        assert!(parse_quic_extra_ports("5443,5443", 21117).is_err());
+        assert!(parse_quic_extra_ports("0", 21117).is_err());
+        assert!(parse_quic_extra_ports("70000", 21117).is_err());
+        assert!(parse_quic_extra_ports("udp/5443", 21117).is_err());
+    }
 
     async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
         let len = payload.len();

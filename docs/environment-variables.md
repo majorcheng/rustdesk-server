@@ -44,7 +44,7 @@ in the inherited process environment.
 | `SEAL-KEY` 🅴 | — | *(empty)* | Enables the sealed UDP control plane. Value is the path to a file holding the base64 form of 32 random bytes, for example `openssl rand -base64 32 > /etc/rustdesk/seal.key` (mode `0600`). Leave empty to keep the listener off. Every hbbs in one cluster shares the same key. Push sessions are kept in process memory: route one peer consistently to one hbbs, or expect up to one registration interval of lost pushes after a node switch. |
 | `SEAL-KEY-NEXT` 🅴 | — | *(empty)* | Path to the next key file, accepted during rotation. Clients switch to it first, then it becomes `SEAL-KEY`. Requests matching neither key are dropped. |
 | `SEAL-PORT` 🅴 | — | `4443` | UDP port of the sealed control plane. Requires `SEAL-KEY`. |
-| `RENDEZVOUS-TLS-PORT` 🅴 | — | *(empty)* | TCP port of the TLS control plane, for example `4443`. Off when empty. Requires `RENDEZVOUS-TLS-CERT` and `RENDEZVOUS-TLS-KEY`. The listener speaks TLS 1.3 with no ALPN, then the usual framed protobuf messages. |
+| `RENDEZVOUS-TLS-PORT` 🅴 | — | `5443` | TCP port of the TLS control plane. The listener is off until `RENDEZVOUS-TLS-CERT` and `RENDEZVOUS-TLS-KEY` are set. The default stays clear of TCP 4443, which the TLS relay may use on the same host. The listener speaks TLS 1.3 with no ALPN, then the usual framed protobuf messages. |
 | `RENDEZVOUS-TLS-CERT` / `RENDEZVOUS-TLS-KEY` 🅴 | — | *(empty)* | PEM certificate chain and private key for the TLS control plane. Clients pin `sha256:<standard-base64 SHA-256(DER)>`; the pin is logged at startup. The same pair can serve hbbr. |
 | `RELAY-SERVERS` | `-r`, `--relay-servers` | *(empty)* | Optional relay server override handed to clients, as comma-separated `host` or `host:port` values. Leave empty when `hbbr` uses the same address as `hbbs` and the standard port `21117`; clients derive it automatically. Set this only when the relay uses a different IP/hostname or a non-standard port. |
 | `RMEM` | `-M`, `--rmem` | `0` (system default) | UDP receive‑buffer size in bytes. Raise the OS limit first: `sudo sysctl -w net.core.rmem_max=52428800`. |
@@ -154,6 +154,7 @@ ports.
 | `RELAY-QUIC` 🅴 | — | `N` | Enables the QUIC relay listener. Requires `RELAY-BOT-TOKEN-SECRET`. |
 | `RELAY-QUIC-BIND` 🅴 | — | `BIND` or `[::]` | Local IP for the QUIC listener. `[::]` binds dual-stack; `0.0.0.0` binds IPv4 only. |
 | `RELAY-QUIC-PORT` 🅴 | — | `PORT` | UDP port for QUIC; defaults to the same numeric port as the TCP relay. |
+| `RELAY-QUIC-EXTRA-PORTS` 🅴 | — | *(empty)* | Comma-separated extra UDP ports for QUIC, for example `5443`. One hbbr process listens on every port with the same certificate, connection limits and pairing table, so peers that arrive on different ports still pair. hbbr refuses to start on an invalid or duplicate entry. |
 | `RELAY-QUIC-CERT` / `RELAY-QUIC-KEY` 🅴 | — | generated `relay-quic.crt.pem` / `.key.pem` | PEM server certificate and key. If both are absent, hbbr generates and persists them relative to its working directory, which is `/var/lib/rustdesk-server/` for the packaged systemd unit. The pin of the loaded certificate is logged at startup. A single certificate shared by every relay in the cluster keeps one pin for all clients and is required when bot configuration is rolled out through a single package; per-relay certificates isolate the blast radius instead. |
 | `RELAY-UPSTREAM-QUIC` 🅴 | — | *(empty)* | Edge-only QUIC upstream, for example `[2001:db8::a]:21117`. IPv6 is preferred. |
 | `RELAY-UPSTREAM-IPV6` 🅴 | — | `prefer` | `prefer`, `only`, or `off` for the QUIC upstream address family. |
@@ -388,11 +389,13 @@ ExecStart=/usr/bin/hbbs
 | 21118 | TCP | hbbs | WebSocket rendezvous (`PORT+2`) |
 | 21119 | TCP | hbbr | WebSocket relay (`hbbr PORT+2`) |
 | 4443 | UDP | hbbs | Sealed control plane (`SEAL-PORT`) |
-| 4443 | TCP | hbbs | TLS control plane (`RENDEZVOUS-TLS-PORT`) |
+| 5443 | TCP | hbbs | TLS control plane (`RENDEZVOUS-TLS-PORT`) |
 | 4444 | TCP | hbbr | TLS relay (`RELAY-TLS-PORT`) |
+| 5443 | UDP | hbbr | Extra QUIC relay port, when set (`RELAY-QUIC-EXTRA-PORTS`) |
 
-hbbs and hbbr cannot share one TCP port, so the TLS relay defaults to 4444 when
-both run on the same host. On a dedicated relay host `RELAY-TLS-PORT=4443` is fine.
+hbbs and hbbr cannot share one TCP port. The hbbs TLS control plane defaults to
+5443, so the TLS relay can use its default 4444 or `RELAY-TLS-PORT=4443` on the
+same host.
 The TLS relay still requires a bot token: a plain relay request over TLS is
 rejected, and service streams keep their own HMAC proof. `hbbs` and `hbbr` refuse
 to start a TLS listener when `RELAY-BOT-TOKEN-SECRET` is empty. Both TLS

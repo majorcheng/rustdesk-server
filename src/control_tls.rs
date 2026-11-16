@@ -11,8 +11,8 @@ use rustls::{
 use std::{io::BufReader, path::Path, sync::Arc};
 use tokio_rustls::TlsAcceptor;
 
-/// hbbs 控制口的默认 TLS 端口。与信封 UDP 端口同号，协议不同。
-pub const DEFAULT_TLS_PORT: u16 = 4443;
+/// hbbs 控制口的默认 TLS 端口。避开 TCP 4443：同机部署时 hbbr 的 TLS relay 可能用它。
+pub const DEFAULT_TLS_PORT: u16 = 5443;
 /// hbbr 的默认 TLS 端口。与 hbbs 同机部署时不能共用端口。
 pub const DEFAULT_RELAY_TLS_PORT: u16 = 4444;
 

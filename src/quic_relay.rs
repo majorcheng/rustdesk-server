@@ -68,64 +68,81 @@ impl IpPreference {
     }
 }
 
-pub(crate) async fn start_listener(
-    bind: Option<IpAddr>,
-    port: u16,
-    cert_path: Option<PathBuf>,
-    key_path: Option<PathBuf>,
-    options: Arc<RelayOptions>,
-    limiter: Limiter,
-) -> ResultType<()> {
-    let (certs, key) = load_or_generate_cert(cert_path.as_deref(), key_path.as_deref())?;
-    let mut crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
-    let quic_crypto = QuicServerConfig::try_from(crypto)?;
-    let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
-    let mut transport = TransportConfig::default();
-    transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
-    transport.keep_alive_interval(Some(KEEP_ALIVE));
-    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
-    transport.max_concurrent_bidi_streams(1u32.into());
-    transport.max_concurrent_uni_streams(0u32.into());
-    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
-    server_config.transport_config(Arc::new(transport));
+/// QUIC relay 的服务端配置与连接上限。
+///
+/// 多个监听端口共用同一份：证书只加载或生成一次，各端口不会各自生成
+/// 证书导致 pin 不一致；连接上限也不会按端口数放大。配对表是进程级的，
+/// 不同端口进来的两端仍能配对。
+pub(crate) struct QuicListener {
+    server_config: ServerConfig,
+    limits: Arc<ConnectionLimits>,
+}
 
-    let socket = bind_udp_socket(bind, port)?;
-    let endpoint = Endpoint::new(
-        EndpointConfig::default(),
-        Some(server_config),
-        socket,
-        Arc::new(TokioRuntime),
-    )?;
-    log::info!("Listening on quic {:?}", endpoint.local_addr()?);
-
-    let limits = Arc::new(ConnectionLimits::new());
-    while let Some(incoming) = endpoint.accept().await {
-        let addr = incoming.remote_address();
-        if is_blocked(addr.ip()).await {
-            log::info!("{} blocked (quic)", addr);
-            incoming.refuse();
-            continue;
-        }
-        if !limits.acquire(addr.ip()).await {
-            log::warn!("quic connection limit reached for {}", addr);
-            incoming.refuse();
-            continue;
-        }
-        let options = options.clone();
-        let limiter = limiter.clone();
-        let limits = limits.clone();
-        tokio::spawn(async move {
-            let result = handle_incoming(incoming, addr, options, limiter).await;
-            if let Err(err) = result {
-                log::debug!("quic connection {} closed: {}", addr, err);
-            }
-            limits.release(addr.ip()).await;
-        });
+impl QuicListener {
+    pub(crate) fn new(cert_path: Option<PathBuf>, key_path: Option<PathBuf>) -> ResultType<Self> {
+        let (certs, key) = load_or_generate_cert(cert_path.as_deref(), key_path.as_deref())?;
+        let mut crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        crypto.alpn_protocols = vec![ALPN.to_vec()];
+        let quic_crypto = QuicServerConfig::try_from(crypto)?;
+        let mut server_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+        let mut transport = TransportConfig::default();
+        transport.max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?));
+        transport.keep_alive_interval(Some(KEEP_ALIVE));
+        transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+        transport.max_concurrent_bidi_streams(1u32.into());
+        transport.max_concurrent_uni_streams(0u32.into());
+        transport.datagram_receive_buffer_size(Some(DATAGRAM_RECV_BUFFER));
+        server_config.transport_config(Arc::new(transport));
+        Ok(Self {
+            server_config,
+            limits: Arc::new(ConnectionLimits::new()),
+        })
     }
-    Ok(())
+
+    /// 在一个 UDP 端口上接受 QUIC 连接，直到 endpoint 关闭。
+    pub(crate) async fn serve(
+        &self,
+        bind: Option<IpAddr>,
+        port: u16,
+        options: Arc<RelayOptions>,
+        limiter: Limiter,
+    ) -> ResultType<()> {
+        let socket = bind_udp_socket(bind, port)?;
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(self.server_config.clone()),
+            socket,
+            Arc::new(TokioRuntime),
+        )?;
+        log::info!("Listening on quic {:?}", endpoint.local_addr()?);
+
+        while let Some(incoming) = endpoint.accept().await {
+            let addr = incoming.remote_address();
+            if is_blocked(addr.ip()).await {
+                log::info!("{} blocked (quic)", addr);
+                incoming.refuse();
+                continue;
+            }
+            if !self.limits.acquire(addr.ip()).await {
+                log::warn!("quic connection limit reached for {}", addr);
+                incoming.refuse();
+                continue;
+            }
+            let options = options.clone();
+            let limiter = limiter.clone();
+            let limits = self.limits.clone();
+            tokio::spawn(async move {
+                let result = handle_incoming(incoming, addr, options, limiter).await;
+                if let Err(err) = result {
+                    log::debug!("quic connection {} closed: {}", addr, err);
+                }
+                limits.release(addr.ip()).await;
+            });
+        }
+        Ok(())
+    }
 }
 
 async fn handle_incoming(
@@ -1134,7 +1151,7 @@ mod integration_tests {
     }
 
     #[hbb_common::tokio::test]
-    async fn quic_listener_pairs_a_pinned_client_and_rejects_wrong_pin() {
+    async fn quic_listener_pairs_across_ports_and_rejects_wrong_pin() {
         let directory = tempfile::tempdir().expect("temp dir");
         let cert_path = directory.path().join("cert.pem");
         let key_path = directory.path().join("key.pem");
@@ -1159,18 +1176,20 @@ mod integration_tests {
             service_timeout: Duration::from_millis(3_000),
         });
         let port = free_udp_port();
-        let limiter = Limiter::new(f64::INFINITY);
-        let listener = tokio::spawn(start_listener(
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            port,
-            Some(cert_path),
-            Some(key_path),
-            options,
-            limiter,
-        ));
+        let extra_port = free_udp_port();
+        let quic = Arc::new(QuicListener::new(Some(cert_path), Some(key_path)).expect("load cert"));
+        let listeners = [port, extra_port].map(|port| {
+            let quic = quic.clone();
+            let options = options.clone();
+            let limiter = Limiter::new(f64::INFINITY);
+            let bind = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+            tokio::spawn(async move { quic.serve(bind, port, options, limiter).await })
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let target = format!("127.0.0.1:{port}");
+        // 两端从不同端口进来，仍在同一个配对表里配对。
+        let extra_target = format!("127.0.0.1:{extra_port}");
         let uuid = "00000000-0000-4000-8000-000000000000";
         let request = |token: String| {
             let mut request = RequestRelay::new();
@@ -1191,7 +1210,7 @@ mod integration_tests {
             .await
             .expect("send first relay request");
 
-        let mut second = connect_upstream(&target, "relay", pin, IpPreference::Prefer)
+        let mut second = connect_upstream(&extra_target, "relay", pin, IpPreference::Prefer)
             .await
             .expect("second pinned client connects");
         second
@@ -1233,7 +1252,9 @@ mod integration_tests {
             Err(error) => assert!(error.is_auth()),
         }
 
-        listener.abort();
+        for listener in listeners {
+            listener.abort();
+        }
         drop(first);
         drop(second);
     }
@@ -1290,14 +1311,16 @@ mod ipv6_tests {
             services: Default::default(),
             service_timeout: Duration::from_millis(3_000),
         });
-        let listener = tokio::spawn(start_listener(
-            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
-            port,
-            Some(cert_path),
-            Some(key_path),
-            options,
-            Limiter::new(f64::INFINITY),
-        ));
+        let quic = QuicListener::new(Some(cert_path), Some(key_path)).expect("load cert");
+        let listener = tokio::spawn(async move {
+            quic.serve(
+                Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+                port,
+                options,
+                Limiter::new(f64::INFINITY),
+            )
+            .await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let target = format!("[::1]:{port}");
