@@ -1,3 +1,18 @@
+rustdesk-server (1.1.30) UNRELEASED; urgency=medium
+
+  * Let one hbbr listen for QUIC on more than one UDP port.
+    RELAY-QUIC-EXTRA-PORTS takes a comma-separated list, for example 5443.
+    Every port shares the certificate, the connection limits and the pairing
+    table, so two peers that arrive on different ports still pair, and old
+    peers keep using RELAY-QUIC-PORT. hbbr refuses to start on an invalid,
+    zero or duplicate entry.
+  * Move the default hbbs TLS control port from 4443 to 5443, so TCP 4443
+    stays free for the TLS relay when hbbs and hbbr share a host. A deployment
+    that sets RENDEZVOUS-TLS-CERT and RENDEZVOUS-TLS-KEY without
+    RENDEZVOUS-TLS-PORT now listens on 5443.
+
+ -- majorcheng <major@thu.cn>  Mon, 16 Nov 2026 13:30:00 +0800
+
 rustdesk-server (1.1.29) UNRELEASED; urgency=medium
 
   * Add an encrypted UDP control plane. A sealed listener runs Noise_NK over
