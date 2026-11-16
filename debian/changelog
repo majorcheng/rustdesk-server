@@ -1,3 +1,27 @@
+rustdesk-server (1.1.29) UNRELEASED; urgency=medium
+
+  * Add an encrypted UDP control plane. A sealed listener runs Noise_NK over
+    UDP with a fresh handshake per request, a mac1 prefilter, length padding,
+    session tracking and per-source rate limits. It accepts only RegisterPeer,
+    RegisterPk and TestNatRequest, and only from rustnet peers, so stock
+    clients keep using the plaintext ports. Pushes are sent only over a session
+    the peer has acknowledged, so a lost response costs one heartbeat of
+    pushes instead of leaving the peer with undecryptable traffic. Sessions
+    expire after ten minutes or when the same address registers in plaintext.
+    The listener stays off until SEAL-KEY is set.
+  * Add TLS listeners for the rendezvous control port and the relay. Both
+    speak TLS 1.3 only, time out an unfinished handshake after ten seconds,
+    and stay closed until a certificate and key are configured. The TLS relay
+    still requires a bot token and now refuses to start with an empty
+    RELAY_BOT_TOKEN_SECRET, so a missing secret can no longer be used to forge
+    one.
+  * Bound the sealed request queue and the source-IP rate limiter. The queue
+    holds 1024 decrypted requests and drops beyond that instead of growing;
+    the source table is a hard cap of 8192 entries. An informed sender can
+    pass mac1 on its own, so neither list may grow with traffic.
+
+ -- majorcheng <major@thu.cn>  Mon, 16 Nov 2026 09:30:00 +0800
+
 rustdesk-server (1.1.28) UNRELEASED; urgency=medium
 
   * Answer UDP NAT requests on the rendezvous port. TestNatRequest was only
