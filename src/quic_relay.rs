@@ -671,6 +671,10 @@ fn cert_pin(der: &[u8]) -> String {
 }
 
 pub(crate) fn verify_bot_token(token: &str, uuid: &str, secret: &str) -> bool {
+    // 空密钥等于公开密钥：拒绝，避免配置缺失时静默 fail-open。
+    if secret.is_empty() {
+        return false;
+    }
     let Some(rest) = token.strip_prefix("rustbot-quic-v1:") else {
         return false;
     };
@@ -1022,10 +1026,7 @@ mod tests {
     }
 
     /// 从 legacy peer 侧读到 needle 为止；超时说明 relay 已经不再转发。
-    async fn read_until(
-        io: &mut tokio::io::DuplexStream,
-        needle: &[u8],
-    ) -> ResultType<Vec<u8>> {
+    async fn read_until(io: &mut tokio::io::DuplexStream, needle: &[u8]) -> ResultType<Vec<u8>> {
         use hbb_common::tokio::io::AsyncReadExt;
 
         let mut seen = Vec::new();

@@ -1,5 +1,7 @@
 use clap::App;
 mod common;
+#[allow(dead_code)]
+mod control_tls;
 mod quic_relay;
 mod relay_server;
 mod service;

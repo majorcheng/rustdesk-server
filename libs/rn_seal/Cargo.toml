@@ -1,0 +1,15 @@
+[package]
+name = "rn_seal"
+version = "0.1.0"
+edition = "2021"
+description = "RustNet 控制面信封协议：Noise NK 封装、mac1、推送会话"
+license = "AGPL-3.0"
+
+[dependencies]
+snow = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+getrandom = "0.2"
+base64 = "0.22"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

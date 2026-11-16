@@ -33,8 +33,8 @@ use std::{
 };
 
 use crate::quic_relay::{self, IpPreference};
-use quinn::SendDatagramError;
 use crate::service::{self, ServiceCode, ServiceRequest, ServiceTarget};
+use quinn::SendDatagramError;
 
 type Usage = (usize, usize, usize, usize);
 
@@ -52,11 +52,14 @@ static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // i
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+/// TLS 握手超时。握手阶段不受帧读取超时保护。
+const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transport {
     Tcp,
     WebSocket,
+    Tls,
     Quic,
 }
 
@@ -137,6 +140,12 @@ fn build_runtime_options(
     let fallback_on_auth_error = parse_flag("RELAY_UPSTREAM_QUIC_FALLBACK_ON_AUTH_ERROR");
     if (quic_enabled || !upstream_quic.is_empty()) && token_secret.is_empty() {
         bail!("RELAY_BOT_TOKEN_SECRET is required when QUIC relay is enabled");
+    }
+    // TLS relay 监听同样靠 bot token 区分客户端；空密钥会让 token 可被任意生成。
+    let tls_configured = !crate::common::get_arg("RELAY_TLS_CERT").trim().is_empty()
+        || !crate::common::get_arg("RELAY_TLS_KEY").trim().is_empty();
+    if tls_configured && token_secret.is_empty() {
+        bail!("RELAY_BOT_TOKEN_SECRET is required when the TLS relay listener is enabled");
     }
     if !auth.is_empty() && auth != "pin" {
         bail!("RELAY_UPSTREAM_QUIC_AUTH only supports pin in v1");
@@ -238,12 +247,27 @@ async fn run_tcp_loop(
     options: Arc<RelayOptions>,
     limiter: Limiter,
 ) -> ResultType<()> {
+    let tls = crate::control_tls::from_env(
+        "RELAY_TLS_PORT",
+        "RELAY_TLS_CERT",
+        "RELAY_TLS_KEY",
+        crate::control_tls::DEFAULT_RELAY_TLS_PORT,
+    )?;
     loop {
         log::info!("Start");
+        let listener_tls = match tls.as_ref() {
+            Some(tls) => Some(crate::common::listen_tcp(bind_addr, tls.port).await?),
+            None => None,
+        };
+        if let Some(listener) = listener_tls.as_ref() {
+            log::info!("Listening on tcp {} for TLS relay", listener.local_addr()?);
+        }
         io_loop(
             crate::common::listen_tcp(bind_addr, port).await?,
             crate::common::listen_tcp(bind_addr, port + 2).await?,
             crate::common::listen_console(bind_addr, port).await?,
+            listener_tls,
+            tls.as_ref(),
             options.clone(),
             limiter.clone(),
         )
@@ -548,6 +572,8 @@ async fn io_loop(
     listener: TcpListener,
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
+    listener_tls: Option<TcpListener>,
+    tls: Option<&crate::control_tls::ControlTls>,
     options: Arc<RelayOptions>,
     limiter: Limiter,
 ) {
@@ -557,7 +583,8 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &options, &limiter, false).await;
+                        handle_connection(stream, addr, &options, &limiter, Transport::Tcp)
+                            .await;
                     }
                     Err(err) => {
                        log::error!("listener.accept failed: {}", err);
@@ -569,7 +596,14 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &options, &limiter, true).await;
+                        handle_connection(
+                            stream,
+                            addr,
+                            &options,
+                            &limiter,
+                            Transport::WebSocket,
+                        )
+                        .await;
                     }
                     Err(err) => {
                        log::error!("listener2.accept failed: {}", err);
@@ -581,10 +615,32 @@ async fn io_loop(
                 match res {
                     Ok((stream, addr))  => {
                         stream.set_nodelay(true).ok();
-                        handle_connection(stream, addr, &options, &limiter, false).await;
+                        handle_connection(stream, addr, &options, &limiter, Transport::Tcp)
+                            .await;
                     }
                     Err(err) => {
                        log::error!("console listener.accept failed: {}", err);
+                       break;
+                    }
+                }
+            }
+            res = crate::common::accept_or_pending(listener_tls.as_ref()) => {
+                match res {
+                    Ok((stream, addr))  => {
+                        stream.set_nodelay(true).ok();
+                        if let Some(tls) = tls {
+                            handle_connection_tls(
+                                stream,
+                                addr,
+                                &options,
+                                &limiter,
+                                tls.acceptor.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(err) => {
+                       log::error!("TLS listener.accept failed: {}", err);
                        break;
                     }
                 }
@@ -598,10 +654,10 @@ async fn handle_connection(
     addr: SocketAddr,
     options: &Arc<RelayOptions>,
     limiter: &Limiter,
-    ws: bool,
+    transport: Transport,
 ) {
     let ip = hbb_common::try_into_v4(addr).ip();
-    if !ws && ip.is_loopback() {
+    if transport != Transport::WebSocket && ip.is_loopback() {
         let limiter = limiter.clone();
         tokio::spawn(async move {
             let mut stream = stream;
@@ -623,8 +679,57 @@ async fn handle_connection(
     let options = options.clone();
     let limiter = limiter.clone();
     tokio::spawn(async move {
-        allow_err!(make_pair(stream, addr, options, limiter, ws).await);
+        allow_err!(make_pair(stream, addr, options, limiter, transport).await);
     });
+}
+
+/// TLS 入口：先完成握手，再复用明文路径的帧处理。
+async fn handle_connection_tls(
+    stream: TcpStream,
+    addr: SocketAddr,
+    options: &Arc<RelayOptions>,
+    limiter: &Limiter,
+    acceptor: tokio_rustls::TlsAcceptor,
+) {
+    let ip = hbb_common::try_into_v4(addr).ip();
+    if BLOCKLIST.read().await.get(&ip.to_string()).is_some() {
+        log::info!("{} blocked", ip);
+        return;
+    }
+    let options = options.clone();
+    let limiter = limiter.clone();
+    tokio::spawn(async move {
+        allow_err!(make_pair_tls(stream, addr, options, limiter, acceptor).await);
+    });
+}
+
+async fn make_pair_tls(
+    stream: TcpStream,
+    addr: SocketAddr,
+    options: Arc<RelayOptions>,
+    limiter: Limiter,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> ResultType<()> {
+    let stream = match timeout(TLS_HANDSHAKE_TIMEOUT_MS, acceptor.accept(stream)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            log::debug!(
+                "TLS handshake with {} timed out after {}ms",
+                addr,
+                TLS_HANDSHAKE_TIMEOUT_MS
+            );
+            return Ok(());
+        }
+    };
+    make_pair_(
+        FramedStream::from(stream, addr),
+        addr,
+        &options,
+        limiter,
+        Transport::Tls,
+    )
+    .await;
+    Ok(())
 }
 
 pub(crate) async fn is_blocked(ip: IpAddr) -> bool {
@@ -636,9 +741,9 @@ async fn make_pair(
     mut addr: SocketAddr,
     options: Arc<RelayOptions>,
     limiter: Limiter,
-    ws: bool,
+    transport: Transport,
 ) -> ResultType<()> {
-    if ws {
+    if transport == Transport::WebSocket {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
             let headers = req.headers();
@@ -672,7 +777,7 @@ async fn make_pair(
             addr,
             &options,
             limiter,
-            Transport::Tcp,
+            transport,
         )
         .await;
     }
@@ -716,6 +821,7 @@ fn transport_name(transport: Transport) -> &'static str {
     match transport {
         Transport::Tcp => "tcp",
         Transport::WebSocket => "websocket",
+        Transport::Tls => "tls",
         Transport::Quic => "quic",
     }
 }
@@ -741,8 +847,12 @@ fn authorize_request(
         stream.close_auth_failed();
         return false;
     }
-    if transport == Transport::Quic && !is_bot {
-        log::warn!("Relay QUIC request from {} is missing bot token", addr);
+    if matches!(transport, Transport::Quic | Transport::Tls) && !is_bot {
+        log::warn!(
+            "Relay {} request from {} is missing bot token",
+            transport_name(transport),
+            addr
+        );
         stream.close_auth_failed();
         return false;
     }
@@ -1054,7 +1164,9 @@ fn forward_datagram(
         Err(SendDatagramError::TooLarge) => {
             if !*logged_too_large {
                 *logged_too_large = true;
-                log::warn!("Relay datagram to {addr} too large ({direction}); check negotiated MTU");
+                log::warn!(
+                    "Relay datagram to {addr} too large ({direction}); check negotiated MTU"
+                );
             }
         }
         Err(err) => log::debug!("Relay datagram to {addr} dropped ({direction}): {err}"),

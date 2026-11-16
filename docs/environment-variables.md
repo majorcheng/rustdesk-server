@@ -41,6 +41,11 @@ in the inherited process environment.
 | `KEY` | `-k`, `--key` | `-` | Public key clients must use, a base64 secret key, or `-` / `_` to load or generate a key pair (`id_ed25519`, `id_ed25519.pub`). `-` and `_` have the same behavior, so explicitly passing `-k _` to `hbbs` is unnecessary. An explicitly empty value disables key validation; see [Keys](#keys-and-encryption). |
 | `BIND` | `-b`, `--bind` | all interfaces | **Available since 1.1.17.** Local IPv4 or IPv6 address on which all `hbbs` TCP, UDP, and WebSocket listeners bind. This does not change the addresses advertised to clients. Supported by `--config`, `.env`, and the inherited environment. |
 | `PORT` | `-p`, `--port` | `21116` | Main TCP/UDP listening port. `hbbs` also binds `PORT-1` (NAT type test) and `PORT+2` (WebSocket). |
+| `SEAL-KEY` 🅴 | — | *(empty)* | Enables the sealed UDP control plane. Value is the path to a file holding the base64 form of 32 random bytes, for example `openssl rand -base64 32 > /etc/rustdesk/seal.key` (mode `0600`). Leave empty to keep the listener off. Every hbbs in one cluster shares the same key. Push sessions are kept in process memory: route one peer consistently to one hbbs, or expect up to one registration interval of lost pushes after a node switch. |
+| `SEAL-KEY-NEXT` 🅴 | — | *(empty)* | Path to the next key file, accepted during rotation. Clients switch to it first, then it becomes `SEAL-KEY`. Requests matching neither key are dropped. |
+| `SEAL-PORT` 🅴 | — | `4443` | UDP port of the sealed control plane. Requires `SEAL-KEY`. |
+| `RENDEZVOUS-TLS-PORT` 🅴 | — | *(empty)* | TCP port of the TLS control plane, for example `4443`. Off when empty. Requires `RENDEZVOUS-TLS-CERT` and `RENDEZVOUS-TLS-KEY`. The listener speaks TLS 1.3 with no ALPN, then the usual framed protobuf messages. |
+| `RENDEZVOUS-TLS-CERT` / `RENDEZVOUS-TLS-KEY` 🅴 | — | *(empty)* | PEM certificate chain and private key for the TLS control plane. Clients pin `sha256:<standard-base64 SHA-256(DER)>`; the pin is logged at startup. The same pair can serve hbbr. |
 | `RELAY-SERVERS` | `-r`, `--relay-servers` | *(empty)* | Optional relay server override handed to clients, as comma-separated `host` or `host:port` values. Leave empty when `hbbr` uses the same address as `hbbs` and the standard port `21117`; clients derive it automatically. Set this only when the relay uses a different IP/hostname or a non-standard port. |
 | `RMEM` | `-M`, `--rmem` | `0` (system default) | UDP receive‑buffer size in bytes. Raise the OS limit first: `sudo sysctl -w net.core.rmem_max=52428800`. |
 | *(config file)* | `-c`, `--config` | *(none)* | Path to an extra INI config file (see precedence above). |
@@ -156,7 +161,9 @@ ports.
 | `RELAY-UPSTREAM-QUIC-PIN` 🅴 | — | *(empty)* | Upstream certificate pin: `sha256:<standard-base64 SHA-256(DER certificate)>`. Required when `RELAY-UPSTREAM-QUIC` is set. |
 | `RELAY-UPSTREAM-QUIC-SNI` 🅴 | — | *(empty)* | SNI used for an IP-literal upstream. Pin mode ignores hostname/SAN but still requires a valid SNI string. |
 | `RELAY-UPSTREAM-QUIC-FALLBACK-ON-AUTH-ERROR` 🅴 | — | `N` | v1 requires `N`: certificate/pin/ALPN/token failures do not fall back to TCP; only network failures do. |
-| `RELAY-BOT-TOKEN-SECRET` 🅴 | — | *(empty)* | HMAC secret for RustBot data-plane relay tokens. Required when the QUIC listener is enabled or `RELAY-UPSTREAM-QUIC` is configured. |
+| `RELAY-BOT-TOKEN-SECRET` 🅴 | — | *(empty)* | HMAC secret for RustBot data-plane relay tokens. Required when the QUIC listener is enabled or `RELAY-UPSTREAM-QUIC` is configured. Also required for the TLS relay listener. |
+| `RELAY-TLS-PORT` 🅴 | — | *(empty)* | TCP port of the TLS relay listener, for example `4444`. Off when empty. Requires `RELAY-TLS-CERT`, `RELAY-TLS-KEY` and `RELAY-BOT-TOKEN-SECRET`. Use a port other than the hbbs TLS port when both run on one host. |
+| `RELAY-TLS-CERT` / `RELAY-TLS-KEY` 🅴 | — | *(empty)* | PEM certificate chain and private key for the TLS relay listener. Clients pin the certificate the same way as the QUIC relay pin. |
 | `RELAY-QUIC-MAX-CONN` / `RELAY-QUIC-MAX-CONN-PER-IP` 🅴 | — | `10000` / `64` | Global and per-IP QUIC connection limits. |
 | `RELAY-SERVICES` 🅴 | — | *(empty)* | Allowlist of service IDs and their endpoints: `rustnet.management=unix:/run/rustbot-api/management.sock` or `name=tcp:127.0.0.1:21202`. Comma-separated. It requires `RELAY-BOT-TOKEN-SECRET`. An edge relay may set it too: declared service IDs are served locally and take precedence over the upstream, everything else is forwarded. A `tcp:` target may be any address the relay itself can reach, so list only what the site is allowed to expose. |
 | `RELAY-SERVICE-TIMEOUT-MS` 🅴 | — | `3000` | Timeout for connecting the configured local endpoint. Allowed range `100`–`30000`. |
@@ -380,6 +387,16 @@ ExecStart=/usr/bin/hbbs
 | 21117 | TCP | hbbr | Relay (`hbbr PORT`) |
 | 21118 | TCP | hbbs | WebSocket rendezvous (`PORT+2`) |
 | 21119 | TCP | hbbr | WebSocket relay (`hbbr PORT+2`) |
+| 4443 | UDP | hbbs | Sealed control plane (`SEAL-PORT`) |
+| 4443 | TCP | hbbs | TLS control plane (`RENDEZVOUS-TLS-PORT`) |
+| 4444 | TCP | hbbr | TLS relay (`RELAY-TLS-PORT`) |
+
+hbbs and hbbr cannot share one TCP port, so the TLS relay defaults to 4444 when
+both run on the same host. On a dedicated relay host `RELAY-TLS-PORT=4443` is fine.
+The TLS relay still requires a bot token: a plain relay request over TLS is
+rejected, and service streams keep their own HMAC proof. `hbbs` and `hbbr` refuse
+to start a TLS listener when `RELAY-BOT-TOKEN-SECRET` is empty. Both TLS
+listeners require TLS 1.3 and time out an unfinished handshake after 10 seconds.
 
 Ports 21118/21119 are only needed for the web client; you can omit them
 otherwise.

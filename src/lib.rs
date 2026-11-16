@@ -1,9 +1,11 @@
 mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod common;
+pub mod control_tls;
+mod database;
 pub(crate) mod federation;
 mod federation_directory;
-mod database;
 mod peer;
 mod registration;
+mod seal;
 mod version;
