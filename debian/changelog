@@ -1,3 +1,14 @@
+rustdesk-server (1.1.31) UNRELEASED; urgency=medium
+
+  * Let the hbbs TLS control listener answer OnlineRequest. rustbot-api can
+    query peer online state over TCP 5443; the plaintext 21115 entry remains.
+    The TLS listener authenticates the server only, so deployments must limit
+    5443 with a listen address or firewall ACL.
+  * Share the OnlineResponse bitmap encoder between TLS and the legacy 21115
+    path, and add a test for left-to-right bit order.
+
+ -- majorcheng <major@thu.cn>  Wed, 18 Nov 2026 11:05:00 +0800
+
 rustdesk-server (1.1.30) UNRELEASED; urgency=medium
 
   * Let one hbbr listen for QUIC on more than one UDP port.
