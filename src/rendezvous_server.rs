@@ -76,6 +76,17 @@ const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 /// TLS 握手超时。握手阶段不进入帧处理，需单独限制。
 const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
 
+/// OnlineResponse 的位图按字节从左到右排列，空列表返回空位图。
+fn encode_online_states(online: &[bool]) -> Bytes {
+    let mut states = BytesMut::zeroed((online.len() + 7) / 8);
+    for (index, is_online) in online.iter().enumerate() {
+        if *is_online {
+            states[index / 8] |= 0x01 << (7 - index % 8);
+        }
+    }
+    states.freeze()
+}
+
 /// 信封路径只在注册真正成功时安装推送会话。
 fn sealed_session_allowed(msg: &RendezvousMessage) -> bool {
     match msg.union.as_ref() {
@@ -778,6 +789,7 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        allow_online: bool,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
@@ -874,6 +886,11 @@ impl RendezvousServer {
                     }
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
+                }
+                Some(rendezvous_message::Union::OnlineRequest(or)) if allow_online => {
+                    let response = self.online_response(&or.peers).await;
+                    Self::send_to_sink(sink, response).await;
+                    return true;
                 }
                 Some(rendezvous_message::Union::RegisterPk(_)) => {
                     let res = register_pk_response::Result::NOT_SUPPORT;
@@ -1230,29 +1247,34 @@ impl RendezvousServer {
     }
 
     #[inline]
+    async fn online_response(&self, peers: &[String]) -> RendezvousMessage {
+        let mut online = Vec::with_capacity(peers.len());
+        for peer_id in peers {
+            let is_online = match self.pm.get_in_memory(peer_id).await {
+                Some(peer) => {
+                    (peer.read().await.last_reg_time.elapsed().as_millis() as i64)
+                        < PEER_REG_TIMEOUT_MS
+                }
+                None => false,
+            };
+            online.push(is_online);
+        }
+
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_online_response(OnlineResponse {
+            states: encode_online_states(&online),
+            ..Default::default()
+        });
+        msg_out
+    }
+
+    #[inline]
     async fn handle_online_request(
         &mut self,
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
-        let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
-        for (i, peer_id) in peers.iter().enumerate() {
-            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
-                // bytes index from left to right
-                let states_idx = i / 8;
-                let bit_idx = 7 - i % 8;
-                if elapsed < PEER_REG_TIMEOUT_MS {
-                    states[states_idx] |= 0x01 << bit_idx;
-                }
-            }
-        }
-
-        let mut msg_out = RendezvousMessage::new();
-        msg_out.set_online_response(OnlineResponse {
-            states: states.into(),
-            ..Default::default()
-        });
+        let msg_out = self.online_response(&peers).await;
         stream.send(&msg_out).await?;
 
         Ok(())
@@ -2014,12 +2036,16 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self
+                        .handle_tcp(&bytes, &mut sink, addr, key, ws, false)
+                        .await
+                    {
                         break;
                     }
                 }
             }
         } else {
+            let allow_online = matches!(&stream, IncomingStream::Tls(_));
             let stream: BoxedStream = match stream {
                 IncomingStream::Plain(stream) => Box::new(stream),
                 IncomingStream::Tls(stream) => Box::new(stream),
@@ -2027,7 +2053,10 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, allow_online)
+                    .await
+                {
                     break;
                 }
             }
@@ -2280,6 +2309,21 @@ mod tests {
         request.relay_server = "relay-a.example:21117".to_owned();
         msg.set_request_relay(request);
         assert!(!rewrite_federated_request_relay(&mut msg, ""));
+    }
+
+    #[test]
+    fn online_states_use_left_to_right_bitmap() {
+        assert!(encode_online_states(&[]).is_empty());
+        assert_eq!(&encode_online_states(&[true])[..], &[0x80]);
+        assert_eq!(&encode_online_states(&[false, true])[..], &[0x40]);
+        assert_eq!(
+            &encode_online_states(&[true, false, false, true, false, false, false, true])[..],
+            &[0x91]
+        );
+        assert_eq!(
+            &encode_online_states(&[true, false, false, false, false, false, false, false, true])[..],
+            &[0x80, 0x80]
+        );
     }
 
     #[test]
