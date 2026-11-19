@@ -75,6 +75,20 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 /// TLS 握手超时。握手阶段不进入帧处理，需单独限制。
 const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 10_000;
+/// 客户端单条消息上限，单位 KiB。0 或非法值回退默认值。
+const DEFAULT_MAX_MESSAGE_KB: usize = 64;
+/// 可调到无上限的开关不算上限。
+const MAX_MESSAGE_KB_CAP: usize = 64 << 10;
+/// tungstenite 0.17 的默认帧上限，调大 MAX_MESSAGE_KB 时不越过它。
+const WS_DEFAULT_MAX_FRAME_SIZE: usize = 16 << 20;
+static MAX_MESSAGE: Lazy<usize> = Lazy::new(|| max_message_kb(&get_arg("MAX_MESSAGE_KB")) << 10);
+
+fn max_message_kb(arg: &str) -> usize {
+    match arg.parse::<usize>() {
+        Ok(kb) if kb > 0 => kb.min(MAX_MESSAGE_KB_CAP),
+        _ => DEFAULT_MAX_MESSAGE_KB,
+    }
+}
 
 /// OnlineResponse 的位图按字节从左到右排列，空列表返回空位图。
 fn encode_online_states(online: &[bool]) -> Bytes {
@@ -98,6 +112,28 @@ fn sealed_session_allowed(msg: &RendezvousMessage) -> bool {
     }
 }
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+const MAX_RELAY_UUID_LEN: usize = 128;
+
+// The peer sends this uuid to whatever relay_server names, so keep control bytes out of it.
+fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
+    if value.is_empty()
+        || value.len() > MAX_RELAY_UUID_LEN
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Invalid relay UUID");
+    }
+    Ok(())
+}
+
+// A peer acknowledging a RequestRelay leaves both fields empty.
+fn validate_relay_response(uuid: &str, relay_server: &str) -> Result<(), &'static str> {
+    if uuid.is_empty() && relay_server.is_empty() {
+        return Ok(());
+    }
+    validate_relay_uuid(uuid)
+}
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -302,6 +338,7 @@ impl RendezvousServer {
             listener2.local_addr()?
         );
         log::info!("Listening on websocket {}", listener3.local_addr()?);
+        log::info!("MAX_MESSAGE_KB={}", *MAX_MESSAGE >> 10);
         let test_addr = get_arg("TEST_HBBS");
         if get_arg("ALWAYS_USE_RELAY").to_uppercase() == "Y" {
             ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
@@ -806,6 +843,13 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if let Err(err) = validate_relay_uuid(&rf.uuid) {
+                        log::warn!(
+                            "Drop RequestRelay from {addr}: {err} (length {})",
+                            rf.uuid.len()
+                        );
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -844,6 +888,13 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
+                    if let Err(err) = validate_relay_response(&rr.uuid, &rr.relay_server) {
+                        log::warn!(
+                            "Drop RelayResponse from {addr}: {err} (length {})",
+                            rr.uuid.len()
+                        );
+                        return false;
+                    }
                     let addr_b = relay_response_source_addr(&rr);
                     if let Ok(true) = self.forward_relay_response(addr_b, rr.clone()).await {
                         return true;
@@ -1922,13 +1973,19 @@ impl RendezvousServer {
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                         let res = rs.check_cmd(data).await;
-                        stream.write_all(res.as_bytes()).await.ok();
+                        if let Err(err) = timeout(1000, stream.write_all(res.as_bytes()))
+                            .await
+                            .unwrap_or_else(|elapsed| Err(elapsed.into()))
+                        {
+                            log::warn!("Failed to send the console reply: {err}");
+                        }
                     }
                 }
             });
             return;
         }
-        let stream = FramedStream::from(stream, addr);
+        let mut stream = FramedStream::from(stream, addr);
+        stream.0.codec_mut().set_max_packet_length(*MAX_MESSAGE);
         tokio::spawn(async move {
             let mut stream = stream;
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
@@ -2031,7 +2088,16 @@ impl RendezvousServer {
                 }
                 Ok(response)
             };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                max_message_size: Some(*MAX_MESSAGE),
+                max_frame_size: Some((*MAX_MESSAGE).min(WS_DEFAULT_MAX_FRAME_SIZE)),
+                ..Default::default()
+            };
+            let ws_stream = timeout(
+                30_000,
+                tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+            )
+            .await??;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
@@ -2050,7 +2116,9 @@ impl RendezvousServer {
                 IncomingStream::Plain(stream) => Box::new(stream),
                 IncomingStream::Tls(stream) => Box::new(stream),
             };
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
+            let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
                 if !self
@@ -2276,6 +2344,48 @@ fn rewrite_federated_request_relay(msg: &mut RendezvousMessage, local_relay: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_message_kb_falls_back_and_caps() {
+        assert_eq!(max_message_kb(""), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("0"), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("abc"), DEFAULT_MAX_MESSAGE_KB);
+        assert_eq!(max_message_kb("128"), 128);
+        assert_eq!(max_message_kb("70000"), MAX_MESSAGE_KB_CAP);
+    }
+
+    #[test]
+    fn relay_uuid_validation() {
+        let uuid = "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12";
+        assert_eq!(validate_relay_response(uuid, "relay.example"), Ok(()));
+        assert_eq!(validate_relay_response("", ""), Ok(()));
+        let max_len = "a".repeat(128);
+        for value in [
+            uuid,
+            "E4C181D0-41C7-4AE6-8EF0-36581B6B2B12",
+            "e4c181d041c74ae68ef036581b6b2b12",
+            "01890a5d-ac96-774b-bcce-b302099a8057",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "a_b-c",
+            max_len.as_str(),
+        ] {
+            assert_eq!(validate_relay_uuid(value), Ok(()), "rejected {value:?}");
+        }
+        let too_long = "a".repeat(129);
+        for value in [
+            "",
+            "\r\nPING\r\n",
+            "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12\n",
+            "e4c181d0 41c7",
+            "{e4c181d0-41c7-4ae6-8ef0-36581b6b2b12}",
+            "e4c181d0\0",
+            "é",
+            too_long.as_str(),
+        ] {
+            assert!(validate_relay_uuid(value).is_err(), "accepted {value:?}");
+            assert!(validate_relay_response(value, "relay.example").is_err());
+        }
+    }
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {

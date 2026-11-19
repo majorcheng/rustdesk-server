@@ -37,9 +37,11 @@ use crate::service::{self, ServiceCode, ServiceRequest, ServiceTarget};
 use quinn::SendDatagramError;
 
 type Usage = (usize, usize, usize, usize);
+/// 等待配对的连接连同它的代次，用于区分同 ID 的新旧等待者。
+type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
 
 lazy_static::lazy_static! {
-    static ref PEERS: Mutex<HashMap<String, Box<dyn StreamTrait>>> = Default::default();
+    static ref PEERS: Mutex<HashMap<String, WaitingPeer>> = Default::default();
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
@@ -50,6 +52,10 @@ static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in m
 static LIMIT_SPEED: AtomicUsize = AtomicUsize::new(32 * 1024 * 1024); // in bit/s
 static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // in bit/s
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
+/// 只有开启配对的 relay 请求是本服务自己的帧；配对后该腿放开到传输默认上限。
+const MAX_RELAY_REQUEST_LEN: usize = 128 << 10;
+/// 写超时：对端不读时不能把整条转发任务挂死。
+const RELAY_WRITE_TIMEOUT_MS: u64 = 30_000;
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
 /// TLS 握手超时。握手阶段不受帧读取超时保护。
@@ -708,7 +714,12 @@ async fn handle_connection(
             if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                 if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                     let res = check_cmd(data, limiter).await;
-                    stream.write_all(res.as_bytes()).await.ok();
+                    if let Err(err) = timeout(1000, stream.write_all(res.as_bytes()))
+                        .await
+                        .unwrap_or_else(|elapsed| Err(elapsed.into()))
+                    {
+                        log::warn!("Failed to send the console reply: {err}");
+                    }
                 }
             }
         });
@@ -804,15 +815,19 @@ async fn make_pair(
                 .or_else(|| headers.get("X-Forwarded-For"))
                 .and_then(|header_value| header_value.to_str().ok());
             if let Some(ip) = real_ip {
-                if ip.contains('.') {
-                    addr = format!("{ip}:0").parse().unwrap_or(addr);
-                } else {
-                    addr = format!("[{ip}]:0").parse().unwrap_or(addr);
+                if let Ok(ip) = ip.parse() {
+                    addr = SocketAddr::new(ip, addr.port());
                 }
             }
             Ok(response)
         };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        // 上限保持 tungstenite 默认值：配对后这条腿要承载会话数据，
+        // 而 0.17 无法在握手后调整消息上限。
+        let ws_stream = timeout(
+            30_000,
+            tokio_tungstenite::accept_hdr_async_with_config(stream, callback, None),
+        )
+        .await??;
         make_pair_(ws_stream, addr, &options, limiter, Transport::WebSocket).await;
     } else {
         make_pair_(
@@ -834,6 +849,8 @@ pub(crate) async fn make_pair_(
     limiter: Limiter,
     transport: Transport,
 ) {
+    let mut stream = stream;
+    stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     let Some(Ok(bytes)) = timeout(30_000, stream.recv()).await.ok().flatten() else {
         return;
     };
@@ -923,9 +940,16 @@ async fn relay_upstream(
         fallback,
         addr
     );
-    if let Err(err) = peer.send_raw(bytes.freeze()).await {
-        log::warn!("failed to send relay request upstream: {}", err);
-        return;
+    match timeout(RELAY_WRITE_TIMEOUT_MS, peer.send_raw(bytes.freeze())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            log::warn!("failed to send relay request upstream: {}", err);
+            return;
+        }
+        Err(_) => {
+            log::warn!("sending relay request upstream timed out");
+            return;
+        }
     }
     relay_pair(stream, &mut peer, addr, limiter).await;
 }
@@ -1144,15 +1168,16 @@ async fn relay_local(
     transport: Transport,
 ) {
     let stream = stream;
-    let mut peer = PEERS.lock().await.remove(&uuid);
-    if let Some(peer) = peer.as_mut() {
+    let mut peers = PEERS.lock().await;
+    if let Some((_, mut peer)) = peers.remove(&uuid) {
+        drop(peers);
         log::info!(
             "Relayrequest {} from {} transport={} got paired",
             uuid,
             addr,
             transport_name(transport)
         );
-        relay_pair(stream, peer, addr, limiter).await;
+        relay_pair(stream, &mut peer, addr, limiter).await;
     } else {
         log::info!(
             "New relay request {} from {} transport={}",
@@ -1160,9 +1185,19 @@ async fn relay_local(
             addr,
             transport_name(transport)
         );
-        PEERS.lock().await.insert(uuid.clone(), Box::new(stream));
+        let generation = Arc::new(());
+        peers.insert(uuid.clone(), (generation.clone(), Box::new(stream)));
+        drop(peers);
         sleep(30.).await;
-        PEERS.lock().await.remove(&uuid);
+        expire_waiter(&mut *PEERS.lock().await, &uuid, &generation);
+    }
+}
+
+/// 只在等待者仍是同一个代次时移除，避免超时删掉复用同一 ID 的新连接。
+fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) {
+    let current = peers.get(id).map(|(current, _)| Arc::ptr_eq(current, generation));
+    if current == Some(true) {
+        peers.remove(id);
     }
 }
 
@@ -1178,6 +1213,10 @@ pub(crate) async fn relay_pair(
         peer.set_raw();
         stream.set_raw();
         log::info!("Both are raw");
+    } else {
+        // 配对后这条腿承载会话数据，不再受 relay 请求的上限约束。
+        peer.set_max_packet_length(usize::MAX);
+        stream.set_max_packet_length(usize::MAX);
     }
     if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await {
         log::info!("Relay of {} closed: {}", addr, err);
@@ -1224,6 +1263,9 @@ async fn relay(
     id: String,
 ) -> ResultType<()> {
     let ip = addr.ip().to_string();
+    // 双栈监听把 IPv4 客户端报成 ::ffff:a.b.c.d，列表里两种形式都可能存在。
+    let unmapped = hbb_common::try_into_v4(addr).ip().to_string();
+    let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&unmapped);
     let mut tm = std::time::Instant::now();
     let mut elapsed = 0;
     let mut total = 0;
@@ -1267,7 +1309,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                        timeout(RELAY_WRITE_TIMEOUT_MS, stream.send_raw(bytes.into())).await??;
                     }
                 } else {
                     break;
@@ -1286,7 +1328,7 @@ async fn relay(
                     total += nb;
                     total_s += nb;
                     if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                        timeout(RELAY_WRITE_TIMEOUT_MS, peer.send_raw(bytes.into())).await??;
                     }
                 } else {
                     break;
@@ -1368,11 +1410,11 @@ async fn relay(
 
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
-            if BLOCKLIST.read().await.get(&ip).is_some() {
+            if listed(&*BLOCKLIST.read().await) {
                 log::info!("{} blocked", ip);
                 break;
             }
-            blacked = BLACKLIST.read().await.get(&ip).is_some();
+            blacked = listed(&*BLACKLIST.read().await);
             tm = std::time::Instant::now();
             let speed = total_s / n;
             if speed > highest_s {
@@ -1430,6 +1472,9 @@ pub(crate) trait StreamTrait: Send + Sync + 'static {
     fn set_raw(&mut self);
     fn close_auth_failed(&mut self) {}
 
+    /// 帧模式下的单包上限；非帧传输忽略。
+    fn set_max_packet_length(&mut self, _n: usize) {}
+
     /// 该传输的无序 datagram 出口（目前只有 QUIC）。
     ///
     /// 返回独立句柄而不是在 stream 上开方法：relay 需要同时轮询两个方向的 stream
@@ -1455,6 +1500,10 @@ impl StreamTrait for FramedStream {
 
     fn set_raw(&mut self) {
         self.set_raw();
+    }
+
+    fn set_max_packet_length(&mut self, n: usize) {
+        self.0.codec_mut().set_max_packet_length(n);
     }
 }
 
@@ -1494,6 +1543,40 @@ impl StreamTrait for tokio_tungstenite::WebSocketStream<TcpStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expire_waiter_keeps_reused_id() {
+        struct DummyStream;
+
+        #[async_trait]
+        impl StreamTrait for DummyStream {
+            async fn recv(&mut self) -> Option<Result<BytesMut, Error>> {
+                None
+            }
+
+            async fn send_raw(&mut self, _bytes: Bytes) -> ResultType<()> {
+                Ok(())
+            }
+
+            fn is_ws(&self) -> bool {
+                false
+            }
+
+            fn set_raw(&mut self) {}
+        }
+
+        let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
+        let stale = Arc::new(());
+        let fresh = Arc::new(());
+        peers.insert("id".to_owned(), (stale.clone(), Box::new(DummyStream)));
+        expire_waiter(&mut peers, "id", &fresh);
+        assert_eq!(peers.len(), 1, "a stale waiter removed a reused id");
+        peers.insert("id".to_owned(), (fresh.clone(), Box::new(DummyStream)));
+        expire_waiter(&mut peers, "id", &stale);
+        assert_eq!(peers.len(), 1, "a stale waiter removed a reused id");
+        expire_waiter(&mut peers, "id", &fresh);
+        assert!(peers.is_empty());
+    }
 
     #[test]
     fn quic_extra_ports_parse_and_reject_conflicts() {
